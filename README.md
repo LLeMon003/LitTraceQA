@@ -11,7 +11,6 @@
 未来工作环境：
 
 ```bash
-source /home/lemon/miniconda3/etc/profile.d/conda.sh
 conda activate littraceqa
 ```
 
