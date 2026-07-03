@@ -1,0 +1,9 @@
+.env
+prompt4codex.txt
+Ce_littraceqa_baseline/
+outputs/
+raw_pdfs/
+
+__pycache__/
+*.pyc
+

@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+title: "LitTraceQA: Literature-Traced Question Answering with Paper Retrieval and Evidence Grounding"
+message: "If you use LitTraceQA, please cite this dataset."
+type: dataset
+authors:
+  - family-names: Wang
+    given-names: Yimu
+repository-code: "https://huggingface.co/datasets/REPLACE_WITH_NAMESPACE/LitTraceQA"
+url: "https://huggingface.co/datasets/REPLACE_WITH_NAMESPACE/LitTraceQA"
+date-released: "2026-06-17"
+license: "LicenseRef-Pending"
+keywords:
+  - question answering
+  - scientific papers
+  - evidence grounding
+  - paper retrieval
+  - benchmark
