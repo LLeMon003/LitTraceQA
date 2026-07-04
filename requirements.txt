@@ -1,6 +1,25 @@
-openai
-python-dotenv
-rank-bm25
-tqdm
-jsonschema
+# Python: 3.12.x
+# LitTraceQA API-based baseline dependencies
+# No local torch/CUDA stack is required because OCR, embedding, and answer generation are called through online APIs.
 
+# Environment and config
+python-dotenv==1.0.1
+
+# Metadata retrieval
+rank-bm25==0.2.2
+numpy==1.26.4
+
+# Progress and validation
+tqdm==4.67.1
+jsonschema==4.23.0
+
+# OpenAI-compatible API clients
+openai==1.59.9
+httpx==0.27.2
+
+# PDF download and HTTP utilities
+requests==2.32.3
+
+# PDF page counting / rendering / image preprocessing
+PyMuPDF==1.24.14
+pillow==10.4.0

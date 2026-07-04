@@ -1,0 +1,26 @@
+{
+  "paper_id": "naacl2025_00094",
+  "pdf_path": "raw_pdfs/pdf/naacl2025_00094.pdf",
+  "status": "ocr_failed",
+  "parser": "deepseek-ai/DeepSeek-OCR",
+  "provider": "siliconflow",
+  "prompt_version": "deepseek_ocr_page_json_v2",
+  "created_at": "2026-07-04T14:36:46.166561+00:00",
+  "reason": "No OCR chunks were produced.",
+  "max_pages": 1,
+  "page_count_processed": 1,
+  "page_count_succeeded": 0,
+  "page_failures": [
+    {
+      "page": 1,
+      "error": "OCR response looked like a prompt/schema echo, not page transcription."
+    }
+  ],
+  "artifact_hashes": {
+    "document.json": "45177acd2fd0f443a0102bb0791a4613411e2955b4ccc68c5d33e15b8216c156",
+    "pages.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "chunks.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "visual_contexts.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "document.md": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+  }
+}

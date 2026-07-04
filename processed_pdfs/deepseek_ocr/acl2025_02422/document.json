@@ -1,0 +1,9 @@
+{
+  "paper_id": "acl2025_02422",
+  "pdf_path": "raw_pdfs/pdf/acl2025_02422.pdf",
+  "status": "ocr_unavailable",
+  "parser": "deepseek-ai/DeepSeek-OCR",
+  "created_at": "2026-07-04T12:07:51.289864+00:00",
+  "reason": "DeepSeek-OCR local runtime unavailable: No module named 'transformers'",
+  "max_pages": null
+}

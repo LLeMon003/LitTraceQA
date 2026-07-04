@@ -1,0 +1,26 @@
+{
+  "paper_id": "cvpr2025_01140",
+  "pdf_path": "raw_pdfs/pdf/cvpr2025_01140.pdf",
+  "status": "ocr_failed",
+  "parser": "deepseek-ai/DeepSeek-OCR",
+  "provider": "siliconflow",
+  "prompt_version": "deepseek_ocr_page_json_v2",
+  "created_at": "2026-07-04T14:19:21.489548+00:00",
+  "reason": "No OCR chunks were produced.",
+  "max_pages": 1,
+  "page_count_processed": 1,
+  "page_count_succeeded": 0,
+  "page_failures": [
+    {
+      "page": 1,
+      "error": "OCR response looked like a prompt/schema echo, not page transcription."
+    }
+  ],
+  "artifact_hashes": {
+    "document.json": "cb190f8a79c19879f32bcd195cc4ffafbf8a44b7c1fb6520ae577249ebefcd6a",
+    "pages.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "chunks.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "visual_contexts.jsonl": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "document.md": "01ba4719c80b6fe911b091a7c05124b64eeece964e09c058ef8f9805daca546b"
+  }
+}
