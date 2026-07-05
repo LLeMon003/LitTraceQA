@@ -1,9 +1,12 @@
 .env
 prompt4codex.md
+Creeper.md
 github_updatescript.txt
 Ce_littraceqa_baseline/
+Ce_littraceqa_baseline_main/
 outputs/
 raw_pdfs/
+processed_pdfs/
 
 __pycache__/
 *.pyc

@@ -10,6 +10,7 @@
 | ------- | ------------------------------------------------ | -------: | -------------: | -------------------------------------------- |
 | Log 001 | PDF-Free Baseline：`metadata_only_title_abstract` |      已实现 |              否 | 只用 title + abstract 完成候选检索与 LLM 回答           |
 | Log 002 | PDF OCR Context VLM Baseline：`pdf_ocr_context_vlm` |   Smoke 已接通 |       读取本地 PDF | 用 DeepSeek-OCR 生成结构化 OCR contexts，再交给 VLM 回答 |
+| Log 003 | PDF VLM Symbolic VLM Baseline：`pdf_vlm_symbolic_vlm` | v5 task-family budget ready | 读取本地 PDF | task-family budget + native-text global page routing + VLM-1 symbolic records + VLM-2 回答 |
 
 ## 仓库当前结构
 
@@ -1035,3 +1036,565 @@ OCR response looked like a prompt/schema echo, not page transcription.
 2. 使用 VLM answer model 直接读取 selected page images，但不声称有 OCR bbox grounding；
 3. 使用更简单的 page-level markdown/text OCR，再由单独 parser 做后处理；
 4. 等待或确认 DeepSeek-OCR 的专用 endpoint / 专用调用协议后，再恢复结构化 OCR 实验。
+
+# Log 003｜PDF VLM Symbolic VLM Baseline：pdf_vlm_symbolic_vlm
+
+## 当前代码版本快照｜v5 task-family budget
+
+当前 `pdf_vlm_symbolic_vlm_baseline` 已从固定 `top_k=5 / top_p=25` 策略，更新为按官方 `task_family` 分配 retrieval 和 page-routing budget。
+同时，当前更新了当下逻辑的数据结构链，在Expected_examples中
+
+当前默认配置：
+
+```env
+TASK_FAMILY_BUDGET_ENABLED=true
+SINGLE_PAPER_TOP_K_PAPERS=5
+SINGLE_PAPER_PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE=5
+MULTI_PAPER_TOP_K_PAPERS=12
+MULTI_PAPER_PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE=3
+SYMBOLIC_ARTIFACT_VERSION=v5_eval_grounded_minimal_symbolic
+VLM2_CONTEXT_MODE=text_only
+VLM2_INCLUDE_PARSE_CONFIDENCE=false
+```
+
+预算语义：
+
+```text
+hidden_source_single_paper / other non-multi task_family
+→ effective_top_k_papers = 5
+→ effective_top_p_pages = 5 × actual_candidate_count = 25
+
+multi_paper
+→ effective_top_k_papers = 12
+→ effective_top_p_pages = 3 × actual_candidate_count = 36
+```
+
+这里的 `top_p` 是 query-level global page ranking 后的页面预算，不是每篇 paper 固定页数。所有候选 PDF 的 native text pages 会进入同一个 query-level page pool，由 `global_native_text_bm25_rules` 排序后选择前 `top_p` 页给 VLM-1。
+
+当前 run report 会额外记录：
+
+```text
+task_family_budget_enabled
+single_paper_budget
+multi_paper_budget
+task_family_budget_usage
+effective_top_k_distribution
+effective_top_p_distribution
+effective_page_routing_top_pages_per_candidate_distribution
+```
+
+当前 VLM 边界仍保持不变：
+
+* VLM-1 只读取 selected rendered page images；
+* VLM-1 输出 evaluator-grounded minimal symbolic records；
+* `record_id`、`source_type`、`reading_order`、`locator` 由系统层生成；
+* VLM-2 不读取 full page image；
+* VLM-2 只接收 selected symbolic evidence；
+* retrieval score、page ranking score、selector score、bbox、parser confidence 不送入 VLM-1 或 VLM-2；
+* native PDF text 只用于 page routing，不作为最终 answer evidence 直接提交。
+
+当前推荐全量 v5 命令：
+
+```bash
+conda activate littraceqa
+
+/usr/bin/time -p python -m pdf_vlm_symbolic_vlm_baseline.run_pdf_vlm_symbolic_vlm_baseline \
+  --official-dir official_dev \
+  --output-dir outputs/pdf_vlm_symbolic_vlm_v5_task_family_budget_full \
+  --pdf-output-dir raw_pdfs \
+  --processed-output-dir processed_pdfs/vlm_symbolic \
+  --top-k-papers 5 \
+  --top-n-records 24 \
+  --top-n-visual-records 6 \
+  --page-routing-enabled \
+  --page-routing-parse-batch-size 16 \
+  --show-progress \
+  --max-parser-json-failures 6 \
+  --env-path .env
+```
+
+注意：`--top-k-papers 5` 在 `TASK_FAMILY_BUDGET_ENABLED=true` 时只是 fallback。实际 top-k 由 `task_family` 决定。
+
+## 实验目标
+
+本阶段目标是在放弃 OCR 方案后，建立一个 **PDF page image -> symbolic layer -> answer VLM** 的双层 VLM baseline。该方案不让 VLM-2 读取完整 PDF page image，而是先由 VLM-1 将 selected rendered PDF pages 转为可审计 symbolic records，再由 selector 选取 compact symbolic evidence 送入 VLM-2。
+
+当前方案的核心路线为：
+
+```text
+task-family budgeted metadata hybrid retrieval
+→ ensure local PDFs
+→ native PyMuPDF text scan for query-level global page ranking
+→ select top-p pages where top_p = effective_pages_per_candidate * effective_top_k
+→ render selected PDF pages
+→ VLM-1 parse selected page images into symbolic records
+→ symbolic validator / page-level cache / context selector
+→ VLM-2 answer from selected symbolic evidence only
+→ parser normalization
+→ official evaluator
+```
+
+该 baseline 的实验意义是验证：
+
+* 是否可以用 native text routing 避免全 PDF page image VLM parsing；
+* 是否可以把 VLM-1 的 page image understanding 结果沉淀为可复用 symbolic cache；
+* 是否可以阻止 retrieval score、selector score、parser confidence、bbox 等非官方评估字段进入 VLM-2；
+* 是否可以用 system-derived locator 将 symbolic records grounding 到官方 evaluator 需要的 coarse evidence locator。
+
+## 当前 baseline 边界
+
+本实验严格遵守以下边界：
+
+* 不使用 OCR；
+* 不让 VLM-2 读取 full page image；
+* VLM-2 只接收 selected symbolic evidence；
+* retrieval score、page ranking score、selector score、parser confidence 不送入任何 VLM；
+* bbox 不作为官方 evidence grounding 目标；
+* native PDF text 只用于 page routing，不作为最终 answer evidence 直接提交；
+* OpenReview PDF 采用 proceedings-first 策略，默认跳过 direct OpenReview 访问；
+* partial / failed parser artifacts 必须显式落盘，不伪装成 complete cache。
+
+## 关键代码逻辑
+
+### 1. Metadata retrieval
+
+当前使用 `hybrid_alias` retrieval，融合：
+
+```text
+title BM25
+abstract BM25
+full metadata BM25
+alias / method-name matching
+venue / year hint
+title exact / substring boost
+```
+
+默认关闭 task-specific topic expansion：
+
+```env
+RETRIEVAL_ENABLE_TOPIC_EXPANSION=false
+```
+
+本次 run 的 retrieval 记录：
+
+```text
+retrieval method: hybrid_alias
+top_k_papers: 5
+retrieval_enable_topic_expansion: False
+```
+
+### 2. PDF 获取策略
+
+当前不在 metadata 阶段直接跳过 OpenReview papers，而是优先尝试官方 proceedings mirror：
+
+```text
+ICLR   → proceedings.iclr.cc
+ICML   → proceedings.mlr.press
+NeurIPS → papers.nips.cc
+```
+
+本次 run 使用：
+
+```text
+PDF_OPENREVIEW_POLICY=proceedings_first_skip_direct_openreview
+```
+
+PDF source distribution：
+
+```text
+cache: 23
+proceedings.icml_pmlr: 4
+proceedings.neurips: 2
+proceedings.iclr: 1
+```
+
+direct OpenReview：
+
+```text
+direct_openreview_skipped_count: 12
+direct_openreview_attempted_count: 0
+```
+
+### 3. Query-level global page routing
+
+当前 page routing 不再是 per-paper top pages，而是 query-level global top-p pages。
+
+当前 v5 task-family budget 版本的配置语义：
+
+```text
+top_p = effective_page_routing_top_pages_per_candidate * actual_candidate_count
+
+single_paper: 5 * 5 = 25
+multi_paper: 3 * 12 = 36
+```
+
+当 `TASK_FAMILY_BUDGET_ENABLED=false` 时，系统回退到通用 `PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE * actual_candidate_count`。
+
+本次 run：
+
+```text
+PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE=5
+top_k_papers=5
+global_top_p_pages_initial=25
+```
+
+也就是说，每个 query 理论上初始选取 25 个全局 ranked pages，而不是每篇固定解析 5 页。`PAGE_ROUTING_PARSE_BATCH_SIZE=16` 只控制调度 batch，不作为 top-p 语义截断。
+
+本次统计：
+
+```text
+total_candidate_pages_before_routing: 604
+top_p_pages_selected_total: 175
+global_parse_batch_size: 16
+global_parse_batches: 14
+vlm1_pages_selected_after_global_routing: 175
+average_global_selected_pages_per_query: 25.0
+```
+
+### 4. VLM-1 symbolic parser
+
+当前 VLM-1 是 document-to-symbol converter。它读取 selected page image，输出 minimal symbolic records。
+
+在本次实验后，VLM-1 输入/输出已进一步收缩到 evaluator-grounded minimal schema：VLM-1 不再被要求生成 bbox、confidence、record_id、source_type、reading_order 或 locator。VLM-1 只需输出：
+
+```json
+{
+  "kind": "text_span | table | figure | equation_algorithm | citation_context | header_footer | unknown",
+  "text": "...",
+  "label": "Table 4 | Figure 2 | Equation 3 | null"
+}
+```
+
+系统层负责：
+
+* 分配 `record_id`；
+* 归一化 `source_type`；
+* 按数组顺序分配 `reading_order`；
+* 从 `label/text` echo 出 official evaluator 需要的 locator，例如：
+  * `Table 4` → `{"page": 6, "table_id": "Table 4"}`;
+  * `Figure 2` → `{"page": 3, "figure_id": "Figure 2"}`;
+  * `Equation (3)` → `{"page": 6, "equation_id": "Equation 3"}`;
+  * `[24]` → `{"page": 12, "citation_id": 24}`。
+
+### 5. VLM-2 answer prompt
+
+VLM-2 只接收 answer-facing fields：
+
+```json
+{
+  "paper_id": "...",
+  "page": 6,
+  "source_type": "table",
+  "locator": {"page": 6, "table_id": "Table 4"},
+  "text": "..."
+}
+```
+
+不送入 VLM-2：
+
+```text
+global_record_id
+record_type
+record_id
+label
+image_path
+score
+bbox_1000
+vlm_parse_confidence
+```
+
+本次 run report 记录：
+
+```text
+vlm2_prompt_context_fields:
+['locator', 'page', 'paper_id', 'source_type', 'text']
+
+fields_removed_from_vlm2_prompt:
+['global_record_id', 'record_type', 'record_id', 'label', 'image_path', 'score', 'bbox_1000', 'vlm_parse_confidence']
+
+vlm2_context_mode: text_only
+vlm2_attached_image_count: 0
+```
+
+## 环境准备
+
+当前工作环境：
+
+```bash
+conda activate littraceqa
+```
+
+核心 `.env` 配置应包括：
+
+```env
+PARSER_MODEL=Qwen/Qwen3-VL-8B-Instruct
+ANSWER_MODEL=Qwen/Qwen3-VL-8B-Instruct
+
+PARSER_EXTRACTION_MODE=text_first_symbolic_transcription
+PARSER_MAX_TOKENS=6144
+PARSER_MAX_RECORDS_PER_CALL=16
+PARSER_MAX_CONTINUATIONS_PER_PAGE=4
+
+RETRIEVAL_METHOD=hybrid_alias
+RETRIEVAL_ENABLE_TOPIC_EXPANSION=false
+PDF_OPENREVIEW_POLICY=proceedings_first_skip_direct_openreview
+
+PAGE_ROUTING_ENABLED=true
+PAGE_ROUTING_SOURCE=native_text
+PAGE_ROUTING_METHOD=global_native_text_bm25_rules
+PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE=5
+PAGE_ROUTING_TOP_PAGES_GLOBAL=
+PAGE_ROUTING_PARSE_BATCH_SIZE=16
+PAGE_ROUTING_ENABLE_PROGRESSIVE_EXPANSION=true
+
+VLM2_CONTEXT_MODE=text_only
+VLM2_INCLUDE_PARSE_CONFIDENCE=false
+```
+
+注意：本次输出目录名使用 `v5_eval_grounded_full`，但 run report 中实际读取到：
+
+```text
+symbolic artifact version: v4_global_query_page_routing
+```
+
+这说明运行时 `.env` 仍未切换到：
+
+```env
+SYMBOLIC_ARTIFACT_VERSION=v5_eval_grounded_minimal_symbolic
+```
+
+因此本次应记录为 **v5 code path / v4 artifact version mismatch** 的 partial failed run，不能视为干净的 v5 cache-compatible 实验。
+
+## Full Run｜v5 evaluator-grounded minimal symbolic
+
+运行命令：
+
+```bash
+conda activate littraceqa
+
+/usr/bin/time -p python -m pdf_vlm_symbolic_vlm_baseline.run_pdf_vlm_symbolic_vlm_baseline \
+  --official-dir official_dev \
+  --output-dir outputs/pdf_vlm_symbolic_vlm_v5_eval_grounded_full \
+  --pdf-output-dir raw_pdfs \
+  --processed-output-dir processed_pdfs/vlm_symbolic \
+  --top-k-papers 5 \
+  --top-n-records 24 \
+  --top-n-visual-records 6 \
+  --page-routing-enabled \
+  --page-routing-parse-batch-size 16 \
+  --show-progress \
+  --max-parser-json-failures 3 \
+  --env-path .env
+```
+
+输出目录：
+
+```text
+outputs/pdf_vlm_symbolic_vlm_v5_eval_grounded_full/
+```
+
+主要输出文件：
+
+```text
+candidate_papers.jsonl
+pdf_availability.jsonl
+native_page_text.jsonl
+global_page_pool.jsonl
+global_page_ranking.jsonl
+global_page_parse_plan.jsonl
+page_rendering_artifacts.jsonl
+parser_artifacts.jsonl
+raw_vlm_parser_responses.jsonl
+symbolic_records.runtime.jsonl
+symbolic_records.debug.jsonl
+selected_symbolic_contexts.prompt.jsonl
+selected_symbolic_contexts.debug.jsonl
+raw_vlm_answer_responses.jsonl
+internal_predictions.jsonl
+predictions.jsonl
+errors.jsonl
+run_report.md
+```
+
+## 当前实验记录
+
+### Full Run｜top-k-papers=5｜global top-p=25｜parse-batch=16
+
+```text
+运行状态：failed
+interrupted reason: Parser JSON/page failure threshold reached: 3 >= 3
+processed query count: 6
+candidate_papers rows: 7
+predictions rows: 6
+errors rows: 7
+
+baseline type: pdf_vlm_symbolic_vlm
+parser model: Qwen/Qwen3-VL-8B-Instruct
+answer model: Qwen/Qwen3-VL-8B-Instruct
+parser extraction mode: text_first_symbolic_transcription
+symbolic artifact version observed by run: v4_global_query_page_routing
+structured cache policy: reuse_complete_only
+
+retrieval:
+- method: hybrid_alias
+- topic expansion: false
+- top_k_papers: 5
+
+page routing:
+- source: native_text
+- method: global_native_text_bm25_rules
+- page_routing_top_pages_per_candidate: 5
+- global_top_p_pages_initial: 25
+- top_p_pages_selected_total: 175
+- global_parse_batch_size: 16
+- global_parse_batches: 14
+- total_candidate_pages_before_routing: 604
+- native_text_scanned_papers: 30
+- native_text_scanned_pages: 604
+
+PDF:
+- existing PDFs: 23
+- newly downloaded PDFs: 7
+- failed PDF downloads: 5
+- proceedings candidate attempts: 8
+- proceedings match success count: 7
+- direct OpenReview skipped count: 12
+- direct OpenReview attempted count: 0
+
+VLM-1:
+- parser API calls: 118
+- total parser calls: 118
+- rendered papers: 50
+- rendered pages: 171
+- page_level_cache_hits: 62
+- page_level_cache_misses: 106
+- complete pages: 161
+- partial pages: 3
+- failed pages: 2
+- pages needing continuation: 5
+- parser JSON/page failures: 3
+- records accepted total: 2008
+- records deduplicated total: 71
+
+VLM-2:
+- context mode: text_only
+- attached image count: 0
+- answer API calls: 6
+- successful predictions: 4
+- parse failures: 2
+- fallback predictions: 2
+```
+
+### Failure Detail
+
+本次 run 在处理到第 7 个 query 的过程中触发：
+
+```text
+Parser JSON/page failure threshold reached: 3 >= 3
+```
+
+错误文件：
+
+```text
+outputs/pdf_vlm_symbolic_vlm_v5_eval_grounded_full/errors.jsonl
+```
+
+主要失败类型是 VLM-1 页面输出不可解析 JSON。结合前一轮运行观察，常见原因包括：
+
+* VLM-1 completion 触顶，`finish_reason=length`；
+* 输出 JSON 没有完整闭合；
+* 大表格或复杂页面导致单页 structured transcription 过长；
+* 当前仍是串行 page parser，失败前已经消耗较多 API 调用。
+
+当前 baseline 选择在 parser JSON/page failures 达到阈值后停止，而不是伪造 page artifacts。
+
+### Local Evaluation
+
+评估命令：
+
+```bash
+python -m pdf_vlm_symbolic_vlm_baseline.evaluate_local \
+  --official-dir official_dev \
+  --pred outputs/pdf_vlm_symbolic_vlm_v5_eval_grounded_full/predictions.jsonl
+```
+
+本次只生成 6 条 prediction，官方 validation 共 55 条，因此 evaluator 报告大量 missing predictions。该结果只作为 partial failed run 的诊断参考，不能作为完整 baseline 分数。
+
+评估结果：
+
+```json
+{
+  "paper_precision_macro": 0.09090909090909091,
+  "paper_recall_macro": 0.09090909090909091,
+  "paper_f1_macro": 0.09090909090909091,
+  "evidence_precision_macro": 0.006060606060606061,
+  "evidence_recall_macro": 0.01818181818181818,
+  "evidence_f1_macro": 0.00909090909090909,
+  "multiple_choice_accuracy": 0.0,
+  "freeform_exact_match": 0.0,
+  "table_row_f1_macro": 0.0,
+  "table_cell_accuracy_macro": 0.0,
+  "table_cell_accuracy_micro": 0.0,
+  "missing_prediction_count": 49,
+  "extra_prediction_count": 0
+}
+```
+
+## 当前方案预期局限
+
+本次实验暴露的主要瓶颈是 VLM-1 parser 的稳定性和效率，而不是 retrieval 或 VLM-2。
+
+当前限制：
+
+* 每个 query 约 25 个 top-p pages，VLM-1 串行解析成本高；
+* 大表格、reference、appendix 或复杂双栏页面容易导致 VLM-1 输出超长；
+* 即使取消 bbox/confidence 等无用字段，复杂页面仍可能超过 JSON 稳定输出能力；
+* 当前 `PARSER_MAX_RECORDS_PER_CALL=16` 对复杂页面可能偏大；
+* `PARSER_MAX_TOKENS=6144` 不是根本解法，继续放大会增加成本和不稳定性；
+* 本次 `.env` 的 artifact version 未切到 v5，存在 cache compatibility 记录不干净的问题；
+* 当前 run 因 `max-parser-json-failures=3` 提前停止，没有完成 55 条全量验证。
+
+## 后续优化方向
+
+下一阶段应优先做不改变实验语义的工程优化：
+
+1. 将 `.env` 修正为：
+
+```env
+SYMBOLIC_ARTIFACT_VERSION=v5_eval_grounded_minimal_symbolic
+```
+
+2. 针对 VLM-1 parser 增加 length failure 的小批量 retry：
+
+```text
+PARSER_RETRY_SMALLER_BATCH_ON_LENGTH=true
+PARSER_SMALL_BATCH_RECORDS_PER_CALL=8
+```
+
+3. 引入 page-level parser 并发：
+
+```text
+PARSER_CONCURRENCY=6
+```
+
+4. 压缩 VLM-1 图像输入：
+
+```text
+PARSER_IMAGE_MAX_SIDE=1536
+PARSER_IMAGE_QUALITY=82
+PARSER_IMAGE_DETAIL=auto
+```
+
+5. 保留当前 evaluator-grounded minimal symbolic schema，不恢复 bbox/confidence 作为 VLM 输出目标。
+
+6. 在 1-query 和 5-query smoke test 中先验证：
+
+```text
+parser JSON/page failure count
+average parser calls per page
+records accepted total
+selected evidence locator quality
+official evaluator partial score
+```
+
+只有当 v5 artifact version、parser retry 和进度/并发机制稳定后，再启动新的 full validation run。

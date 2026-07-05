@@ -4,6 +4,8 @@ import re
 from typing import Any
 from urllib.parse import parse_qs, urlparse
 
+from .proceedings_fallbacks import proceedings_pdf_source
+
 
 URL_RE = re.compile(r"https?://[^\s<>\"]+")
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Za-z0-9]+\b")
@@ -14,6 +16,9 @@ OPENREVIEW_ID_RE = re.compile(r"\b[A-Za-z0-9_-]{8,}\b")
 
 TRAILING_PUNCTUATION = ".,;)]}>\"'"
 PDF_PRIORITIES = {
+    "proceedings.iclr": -3,
+    "proceedings.icml_pmlr": -3,
+    "proceedings.neurips": -3,
     "metadata_pdf_url": 0,
     "direct_pdf": 1,
     "arxiv": 2,
@@ -22,6 +27,7 @@ PDF_PRIORITIES = {
     "direct_url": 5,
     "unknown": 9,
 }
+DEFAULT_OPENREVIEW_POLICY = "proceedings_first_skip_direct_openreview"
 
 
 def _walk_values(obj: Any) -> list[tuple[str, Any]]:
@@ -119,7 +125,23 @@ def extract_identifiers(metadata: dict[str, Any]) -> dict[str, list[str]]:
     return identifiers
 
 
-def extract_pdf_candidate_urls(metadata: dict[str, Any]) -> list[dict[str, Any]]:
+def metadata_has_openreview(metadata: dict[str, Any]) -> bool:
+    identifiers = extract_identifiers(metadata)
+    if identifiers["openreview_ids"]:
+        return True
+    for key, value in _walk_values(metadata):
+        if "openreview" in str(key).lower() and str(value or "").strip():
+            return True
+        if isinstance(value, str) and "openreview.net" in value.lower():
+            return True
+    return False
+
+
+def extract_pdf_candidate_urls(
+    metadata: dict[str, Any],
+    *,
+    openreview_policy: str = DEFAULT_OPENREVIEW_POLICY,
+) -> list[dict[str, Any]]:
     """Extract reproducible, public PDF download candidates from paper metadata."""
     identifiers = extract_identifiers(metadata)
     candidates: list[dict[str, Any]] = []
@@ -140,20 +162,32 @@ def extract_pdf_candidate_urls(metadata: dict[str, Any]) -> list[dict[str, Any]]
         )
 
     explicit_pdf_url = str(metadata.get("pdf_url") or "").strip()
+    is_openreview = metadata_has_openreview(metadata)
+    if is_openreview and openreview_policy.startswith("proceedings_first"):
+        try:
+            proceedings_source = proceedings_pdf_source(metadata)
+        except Exception:
+            proceedings_source = None
+        if proceedings_source:
+            add(str(proceedings_source["source_type"]), str(proceedings_source["url"]), str(proceedings_source.get("reason") or "matched official proceedings mirror"))
+
     if explicit_pdf_url:
-        add("metadata_pdf_url", explicit_pdf_url, "metadata contains explicit pdf_url field")
+        if "openreview.net" not in explicit_pdf_url.lower() or openreview_policy.endswith("allow_direct_openreview"):
+            add("metadata_pdf_url", explicit_pdf_url, "metadata contains explicit pdf_url field")
 
     for url in identifiers["pdf_urls"]:
-        add("direct_pdf", url, "metadata string contains a direct PDF-looking URL")
+        if "openreview.net" not in url.lower() or openreview_policy.endswith("allow_direct_openreview"):
+            add("direct_pdf", url, "metadata string contains a direct PDF-looking URL")
 
     for arxiv_id in identifiers["arxiv_ids"]:
         add("arxiv", f"https://arxiv.org/pdf/{arxiv_id}.pdf", "metadata contains arXiv identifier")
 
     for openreview_id in identifiers["openreview_ids"]:
-        if openreview_id.startswith("http"):
-            add("openreview", openreview_id, "metadata contains OpenReview URL")
-        else:
-            add("openreview", f"https://openreview.net/pdf?id={openreview_id}", "metadata contains OpenReview identifier")
+        if openreview_policy.endswith("allow_direct_openreview"):
+            if openreview_id.startswith("http"):
+                add("openreview", openreview_id, "metadata contains OpenReview URL")
+            else:
+                add("openreview", f"https://openreview.net/pdf?id={openreview_id}", "metadata contains OpenReview identifier")
 
     for doi in identifiers["dois"]:
         add("doi", f"https://doi.org/{doi}", "metadata contains DOI")
@@ -161,7 +195,8 @@ def extract_pdf_candidate_urls(metadata: dict[str, Any]) -> list[dict[str, Any]]
     for url in identifiers["urls"]:
         if url not in identifiers["pdf_urls"]:
             source_type = "direct_url" if url.startswith(("http://", "https://")) else "unknown"
-            add(source_type, url, "metadata contains non-PDF URL")
+            if "openreview.net" not in url.lower() or openreview_policy.endswith("allow_direct_openreview"):
+                add(source_type, url, "metadata contains non-PDF URL")
 
     candidates.sort(key=lambda item: (item["priority"], item["url"]))
     return candidates

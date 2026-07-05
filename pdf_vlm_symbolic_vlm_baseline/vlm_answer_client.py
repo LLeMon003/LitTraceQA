@@ -1,0 +1,107 @@
+from __future__ import annotations
+
+import base64
+import io
+import json
+import time
+import urllib.request
+from pathlib import Path
+from typing import Any
+
+from PIL import Image
+
+from .config import PipelineConfig, is_api_key_configured
+from .vlm_parser_client import _model_looks_vision_capable
+
+
+class VLMAnswerClient:
+    def __init__(self, config: PipelineConfig, retries: int = 2) -> None:
+        self.config = config
+        self.retries = retries
+
+    def supports_text_generation(self) -> bool:
+        return is_api_key_configured(self.config.answer_api_key) and bool(self.config.answer_model)
+
+    def supports_image_input(self) -> bool:
+        return self.supports_text_generation() and _model_looks_vision_capable(self.config.answer_model)
+
+    def _image_to_data_url(self, image_path: str | Path, max_side: int = 1600, quality: int = 85) -> str:
+        with Image.open(image_path) as image:
+            image = image.convert("RGB")
+            width, height = image.size
+            scale = min(1.0, max_side / max(width, height))
+            if scale < 1.0:
+                image = image.resize((max(1, int(width * scale)), max(1, int(height * scale))))
+            buffer = io.BytesIO()
+            image.save(buffer, format="JPEG", quality=quality, optimize=True)
+        return f"data:image/jpeg;base64,{base64.b64encode(buffer.getvalue()).decode('ascii')}"
+
+    def _with_images(self, messages: list[dict[str, Any]], image_paths: list[str | Path] | None) -> list[dict[str, Any]]:
+        if not image_paths or not self.supports_image_input():
+            return messages
+        converted = [dict(message) for message in messages]
+        last_user = max((idx for idx, message in enumerate(converted) if message.get("role") == "user"), default=-1)
+        if last_user < 0:
+            return converted
+        content: list[dict[str, Any]] = [{"type": "text", "text": str(converted[last_user].get("content", ""))}]
+        seen: set[str] = set()
+        for image_path in image_paths:
+            path = Path(image_path)
+            if not path.exists() or str(path) in seen:
+                continue
+            seen.add(str(path))
+            content.append({"type": "image_url", "image_url": {"url": self._image_to_data_url(path), "detail": "high"}})
+        converted[last_user]["content"] = content
+        return converted
+
+    def generate_prediction(self, messages: list[dict[str, Any]], image_paths: list[str | Path] | None = None) -> dict[str, Any]:
+        if not self.supports_text_generation():
+            raise RuntimeError("Answer VLM text generation is not configured.")
+        url = self.config.answer_base_url.rstrip("/") + "/chat/completions"
+        payload = {
+            "model": self.config.answer_model,
+            "messages": self._with_images(messages, image_paths),
+            "temperature": self.config.answer_temperature,
+            "max_tokens": self.config.answer_max_tokens,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.config.answer_api_key}"}
+        last_error: Exception | None = None
+        for attempt in range(self.retries + 1):
+            try:
+                request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+                with urllib.request.urlopen(request, timeout=self.config.answer_timeout_seconds) as response:
+                    raw = response.read().decode("utf-8", errors="replace")
+                data = json.loads(raw)
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                return {"raw_response": data, "content": content}
+            except Exception as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(2**attempt)
+        raise RuntimeError(f"Answer VLM call failed: {last_error}") from last_error
+
+
+def probe_text_json(model: str, api_key: str | None, base_url: str, timeout_seconds: float = 30) -> dict[str, Any]:
+    if not is_api_key_configured(api_key):
+        return {"model": model, "can_generate": False, "reason": "API key missing or placeholder."}
+    url = base_url.rstrip("/") + "/chat/completions"
+    payload = {
+        "model": model,
+        "messages": [{"role": "system", "content": "Return JSON only."}, {"role": "user", "content": '{"ok": true}'}],
+        "temperature": 0,
+        "max_tokens": 32,
+    }
+    try:
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": f"Bearer {api_key}"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=timeout_seconds) as response:
+            data = json.loads(response.read().decode("utf-8", errors="replace"))
+        content = str(data.get("choices", [{}])[0].get("message", {}).get("content", ""))
+        return {"model": model, "can_generate": bool(content.strip()), "content": content, "raw_response": data}
+    except Exception as exc:
+        return {"model": model, "can_generate": False, "reason": str(exc)}
