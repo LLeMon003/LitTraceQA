@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
 from .metadata_index import BM25Okapi, tokenize
-from .symbolic_schema import VISUAL_RECORD_TYPES
+from .symbolic_schema import (
+    HEADER_FOOTER_RECORD_TYPES,
+    OFFICIAL_EVIDENCE_SOURCE_TYPES,
+    VISUAL_RECORD_TYPES,
+    grounding_label_from_record,
+    to_official_source_type,
+)
 
 
 TYPE_BOOSTS = {
@@ -29,21 +36,77 @@ def _record_image_ref(record: dict[str, Any]) -> str:
     return f"attached_record_{str(record.get('record_id') or 'record')}"
 
 
-def project_context_for_vlm2(
-    record: dict[str, Any],
-    mode: str,
-    include_confidence: bool = True,
-) -> dict[str, Any]:
+def _is_header_footer_record(record: dict[str, Any]) -> bool:
+    return str(record.get("record_type") or "").strip() in HEADER_FOOTER_RECORD_TYPES
+
+
+def project_context_for_vlm2(record: dict[str, Any], mode: str) -> dict[str, Any]:
     projected = {
         "paper_id": record.get("paper_id"),
         "page": record.get("page"),
         "source_type": record.get("source_type"),
-        "locator": record.get("locator") or {"page": record.get("page")},
+        "label": record.get("label"),
+        "grounding_label": record.get("grounding_label"),
         "text": record.get("text"),
     }
+    if projected["grounding_label"] is None:
+        projected.pop("grounding_label", None)
     if mode == "cropped_image":
         projected["image_ref"] = _record_image_ref(record)
     return projected
+
+
+def _record_key(record: dict[str, Any]) -> str:
+    return str(record.get("global_record_id") or f"{record.get('paper_id')}::{record.get('page')}::{record.get('record_id')}::{record.get('text')}")
+
+
+def _add_ranked(
+    selected: list[dict[str, Any]],
+    seen: set[str],
+    records: list[dict[str, Any]],
+    limit: int,
+) -> None:
+    if limit <= 0:
+        return
+    for record in records:
+        if len(selected) >= limit:
+            break
+        key = _record_key(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        selected.append(record)
+
+
+def _select_with_type_budgets(
+    ranked: list[dict[str, Any]],
+    total_budget: int,
+    primary_evidence_type: str | None,
+    primary_min: int,
+    support_text_min: int,
+    context_types_enabled: bool,
+    per_type_budget: int,
+) -> list[dict[str, Any]]:
+    total_budget = max(1, int(total_budget or 1))
+    primary = to_official_source_type(source_type=primary_evidence_type) or str(primary_evidence_type or "")
+    selected: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    if primary in OFFICIAL_EVIDENCE_SOURCE_TYPES:
+        _add_ranked(selected, seen, [r for r in ranked if r.get("source_type") == primary], min(primary_min, total_budget))
+    if len(selected) < total_budget:
+        _add_ranked(selected, seen, [r for r in ranked if r.get("source_type") == "text_span"], min(total_budget, len(selected) + support_text_min))
+    if context_types_enabled and len(selected) < total_budget:
+        for source_type in ("table", "figure", "equation_algorithm", "citation_context", "text_span"):
+            _add_ranked(
+                selected,
+                seen,
+                [r for r in ranked if r.get("source_type") == source_type],
+                min(total_budget, len(selected) + max(0, per_type_budget)),
+            )
+            if len(selected) >= total_budget:
+                break
+    _add_ranked(selected, seen, ranked, total_budget)
+    return selected[:total_budget]
 
 
 def select_symbolic_contexts(
@@ -57,13 +120,18 @@ def select_symbolic_contexts(
     query_id: str | None = None,
     vlm2_context_mode: str = "text_only",
     include_parse_confidence: bool = True,
+    evidence_total_budget: int | None = None,
+    primary_evidence_min: int = 6,
+    support_text_min: int = 4,
+    context_types_enabled: bool = True,
+    context_type_budget_per_type: int = 3,
 ) -> dict[str, Any]:
     allow_header_footer = _query_needs_header_footer(query)
     valid = [
         r
         for r in candidate_records
         if r.get("validation_status") != "rejected"
-        and (allow_header_footer or r.get("record_type") != "header_footer")
+        and (allow_header_footer or not _is_header_footer_record(r))
     ]
     if not valid:
         return {
@@ -76,6 +144,10 @@ def select_symbolic_contexts(
             "selected_records_debug": [],
             "selected_records": [],
             "selected_visual_records": [],
+            "source_type_distribution": {source_type: 0 for source_type in OFFICIAL_EVIDENCE_SOURCE_TYPES},
+            "primary_evidence_type_count": 0,
+            "supporting_evidence_count": 0,
+            "grounding_label_hints_by_type": {},
         }
     query_tokens = tokenize(query)
     corpus = [tokenize(" ".join([str(r.get("text") or ""), str(r.get("label") or "")])) for r in valid]
@@ -85,13 +157,17 @@ def select_symbolic_contexts(
     processed = Path(processed_root)
     ranked: list[dict[str, Any]] = []
     for record, bm25_score in zip(valid, scores):
+        source_type = to_official_source_type(record.get("record_type"), record.get("source_type"))
+        if source_type not in OFFICIAL_EVIDENCE_SOURCE_TYPES:
+            continue
         score = float(bm25_score)
         score += boosts.get(str(record.get("record_type")), 0.0)
+        score += boosts.get(source_type, 0.0)
         score += 0.15 * float(record.get("_candidate_bm25_score") or 0.0)
         record_type = str(record.get("record_type") or "")
         if str(record.get("_page_status") or record.get("page_status") or "") == "partial":
             score -= 0.5
-        if record_type == "header_footer":
+        if record_type in HEADER_FOOTER_RECORD_TYPES:
             score -= 0.75
         if record_type == "citation_context" and primary_evidence_type != "citation_context":
             score -= 1.0
@@ -103,17 +179,27 @@ def select_symbolic_contexts(
             "global_record_id": record.get("global_record_id"),
             "record_id": record.get("record_id"),
             "record_type": record.get("record_type"),
-            "source_type": record.get("source_type"),
+            "source_type": source_type,
             "label": record.get("label"),
+            "grounding_label": grounding_label_from_record(source_type, record.get("label")),
             "score": round(score, 6),
             "text": record.get("text"),
             "locator": record.get("locator") or {"page": record.get("page")},
             "image_path": _image_path_for(record, processed, parser_model_slug),
+            "figure_crop_path": record.get("figure_crop_path"),
         }
         selected["_page_status"] = record.get("_page_status") or record.get("page_status")
         ranked.append(selected)
     ranked.sort(key=lambda item: item["score"], reverse=True)
-    selected_records_internal = ranked[:top_n_records]
+    selected_records_internal = _select_with_type_budgets(
+        ranked,
+        evidence_total_budget or top_n_records,
+        primary_evidence_type,
+        primary_evidence_min,
+        support_text_min,
+        context_types_enabled,
+        context_type_budget_per_type,
+    )
     partial_count = sum(1 for r in selected_records_internal if r.get("_page_status") == "partial")
     selection_method = "symbolic_lexical_bm25_without_embedding"
     selected_records_debug = []
@@ -127,10 +213,21 @@ def select_symbolic_contexts(
         project_context_for_vlm2(
             record,
             vlm2_context_mode,
-            include_confidence=include_parse_confidence,
         )
         for record in selected_records_internal
     ]
+    distribution = dict(Counter(str(r.get("source_type")) for r in selected_evidence if isinstance(r, dict)))
+    for source_type in OFFICIAL_EVIDENCE_SOURCE_TYPES:
+        distribution.setdefault(source_type, 0)
+    primary_source = to_official_source_type(source_type=primary_evidence_type) or str(primary_evidence_type or "")
+    primary_count = sum(1 for r in selected_evidence if r.get("source_type") == primary_source)
+    grounding_label_hints_by_type = dict(
+        Counter(
+            str((r.get("grounding_label") or {}).get("type"))
+            for r in selected_evidence
+            if isinstance(r.get("grounding_label"), dict)
+        )
+    )
     visual_records = [
         {k: v for k, v in r.items() if not k.startswith("_")}
         for r in ranked
@@ -147,4 +244,8 @@ def select_symbolic_contexts(
         "selected_records_debug": selected_records_debug,
         "selected_records": selected_records_debug,
         "selected_visual_records": visual_records[:top_n_visual_records],
+        "source_type_distribution": distribution,
+        "primary_evidence_type_count": primary_count,
+        "supporting_evidence_count": max(0, len(selected_evidence) - primary_count),
+        "grounding_label_hints_by_type": grounding_label_hints_by_type,
     }

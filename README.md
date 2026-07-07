@@ -1598,3 +1598,347 @@ official evaluator partial score
 ```
 
 只有当 v5 artifact version、parser retry 和进度/并发机制稳定后，再启动新的 full validation run。
+
+# Log 003｜pdf_vlm_symbolic_vlm_baseline v5, VLM-2 Rerun, Metadata-Only V2
+
+## 当前目标
+
+本阶段围绕 `pdf_vlm_symbolic_vlm_baseline` 做了三类实验：
+
+1. 完成 v5 symbolic pipeline 的全量运行与评估。
+2. 只重跑 VLM-2 answer stage，修复 answer contract、freeform、multiple-choice、table schema 等输出问题。
+3. 新增 metadata-only v2：`top-k metadata candidates -> VLM-2 paper selection -> prediction.gold_papers`，其中 evidence 和 answer 仍为空。
+
+当前 pipeline 的完整数据流已整理在：
+
+```text
+Expected_examples/task_family_single_query_data_flow.md
+```
+
+## 当前主流程
+
+```text
+validation_inputs.jsonl
++ sanitized options/schema from validation.jsonl
++ paper_metadata.jsonl
+-> hybrid metadata retrieval
+-> optional multi-paper query decomposition
+-> optional topic-profile expansion only when explicitly enabled
+-> PDF cache / proceedings-first source resolution
+-> native-text global page routing
+-> selected rendered page images
+-> VLM-1 minimal symbolic parsing
+-> processed_pdfs durable symbolic store
+-> symbolic context selector
+-> VLM-2 answer generation from selected symbolic evidence
+-> parser normalization
+-> official predictions.jsonl
+```
+
+VLM-2 不接收 full page image、native PDF、URL、local file path、retrieval score、selector score、bbox、parser confidence 或 internal record id。VLM-2 只接收 selected symbolic evidence 的 answer-facing projection。
+
+## 关键数据结构
+
+### candidate_papers.jsonl
+
+记录 metadata retrieval 的候选论文与审计分数：
+
+```json
+{
+  "query_id": "q_001",
+  "task_family": "hidden_source_single_paper",
+  "task_family_bucket": "single_paper",
+  "effective_top_k_papers": 5,
+  "effective_top_p_pages": 25,
+  "topic_expansion": null,
+  "candidates": [
+    {
+      "rank": 1,
+      "paper_id": "acl2025_00005",
+      "title": "...",
+      "abstract": "...",
+      "retrieval_method": "hybrid_alias",
+      "retrieval_score_components": {
+        "title_bm25": 13.83,
+        "abstract_bm25": 67.07,
+        "full_bm25": 72.72,
+        "method_substring_boost": 90.0
+      }
+    }
+  ]
+}
+```
+
+这些 score 只用于审计，不送入任何 VLM。
+
+### symbolic_records.runtime.jsonl
+
+记录 VLM-1 后的 evaluator-grounded minimal symbolic records：
+
+```json
+{
+  "paper_id": "acl2025_00005",
+  "page": 6,
+  "record_id": "p006_r0003",
+  "record_type": "table",
+  "source_type": "table",
+  "label": "Table 4",
+  "text": "Dataset Length Eval. Metrics ... Absolute Δ 18.99 18.45 14.70 ...",
+  "locator": {"page": 6, "table_id": "Table 4"},
+  "page_status": "complete",
+  "figure_crop_path": null
+}
+```
+
+### processed_pdfs durable symbolic store
+
+当前结构化数据统一存入：
+
+```text
+processed_pdfs/vlm_symbolic_runs/<run_or_cache_name>/<parser_model_slug>/<paper_id>/
+  artifact_status.json
+  symbolic_records.runtime.jsonl
+  symbolic_records.debug.jsonl
+  symbolic_index.json
+  page_records/
+  page_status/
+  page_images/
+  page_XXX/figure_crops/
+```
+
+`processed_pdfs` 的职责是保存可复用、尽可能完整的 processed symbolic information。`outputs/` 主要保存 run-level audit、prompt、raw response 和 predictions。
+
+### selected_symbolic_contexts.prompt.jsonl
+
+这是 VLM-2 真正看到的 symbolic evidence：
+
+```json
+{
+  "query_id": "q_001",
+  "selected_evidence": [
+    {
+      "paper_id": "acl2025_00005",
+      "page": 6,
+      "source_type": "table",
+      "label": "Table 4",
+      "grounding_label": {"type": "table_id", "value": "Table 4"},
+      "text": "Dataset Length Eval. Metrics ..."
+    }
+  ],
+  "has_partial_artifacts": false,
+  "attached_image_refs": []
+}
+```
+
+prompt projection 会移除 retrieval score、selector score、bbox、parser confidence、record id、local path 和 full page image。
+
+### predictions.jsonl
+
+官方 prediction：
+
+```json
+{
+  "query_id": "q_001",
+  "gold_papers": [{"paper_id": "acl2025_00005"}],
+  "evidence": [
+    {
+      "paper_id": "acl2025_00005",
+      "source_type": "table",
+      "locator": {"page": 6, "table_id": "Table 4"}
+    }
+  ],
+  "answer": {
+    "freeform": {"text": "14.70"},
+    "multiple_choice": {"gold": "C"}
+  }
+}
+```
+
+## Answer Contract 修复
+
+最初 VLM-2 的 `multiple_choice` 和 `table` 输出很差，主要原因是 options/schema 不在 `validation_inputs.jsonl`，而在 `validation.jsonl` 的 answer 容器中。
+
+当前修复策略：
+
+```text
+validation_inputs.jsonl:
+  query_id, task_family, primary_evidence_type, question, answer_types
+
+validation.jsonl:
+  only read answer.multiple_choice.options
+  only read answer.table.schema
+  never read answer.*.gold, gold_papers, evidence
+```
+
+同时修复了：
+
+```text
+bare string freeform -> {"text": "..."}
+missing freeform + valid MC key -> fill freeform from option text
+dynamic required_answer_fields
+dynamic required_answer_shape
+```
+
+## VLM-2 Rerun 结果
+
+VLM-2-only rerun 使用已有 retrieval、page routing、VLM-1 symbolic cache 和 selected symbolic contexts，只重跑 answer generation。
+
+### 8B Instruct rerun
+
+在修复 answer contract、freeform/table 输出后，8B rerun 曾得到：
+
+```json
+{
+  "paper_precision_macro": 0.8045454545454546,
+  "paper_recall_macro": 0.5545454545454546,
+  "paper_f1_macro": 0.6074025974025974,
+  "evidence_f1_macro": 0.33146005509641874,
+  "multiple_choice_accuracy": 0.4878048780487805,
+  "freeform_exact_match": 0.15384615384615385,
+  "table_row_f1_macro": 0.31233766233766236,
+  "table_cell_accuracy_micro": 0.2222222222222222
+}
+```
+
+### 32B Instruct rerun
+
+当前 `.env` 使用：
+
+```env
+ANSWER_MODEL=Qwen/Qwen3-VL-32B-Instruct
+ANSWER_MAX_TOKENS=4096
+ANSWER_TEMPERATURE=0
+```
+
+32B VLM-2-only rerun：
+
+```json
+{
+  "paper_precision_macro": 0.7881818181818182,
+  "paper_recall_macro": 0.55,
+  "paper_f1_macro": 0.5978787878787879,
+  "evidence_precision_macro": 0.3310822510822511,
+  "evidence_recall_macro": 0.33181818181818185,
+  "evidence_f1_macro": 0.2970431588613407,
+  "multiple_choice_accuracy": 0.5609756097560976,
+  "freeform_exact_match": 0.038461538461538464,
+  "table_row_f1_macro": 0.4065656565656566,
+  "table_cell_accuracy_macro": 0.13383838383838384,
+  "table_cell_accuracy_micro": 0.18518518518518517
+}
+```
+
+32B 的输出结构完整性更好：
+
+```text
+free_empty: 0
+mc_empty: 0
+table_empty: 0
+fallback_predictions: 0
+```
+
+但 freeform exact 和 evidence F1 不一定优于 8B。这说明模型规模不是当前唯一瓶颈，selected symbolic context 的质量影响很大。
+
+## Metadata-Only V2
+
+metadata-only v2 不是直接提交 retrieval top-k。它的流程是：
+
+```text
+top-k metadata candidates
+-> VLM-2 sees title/abstract/authors/venue/year only
+-> VLM-2 selects prediction.gold_papers
+-> evidence = []
+-> answer fields = empty values
+```
+
+输出目录：
+
+```text
+outputs/pdf_vlm_symbolic_vlm_baseline_metadata_only_v2/
+  candidate_papers.jsonl
+  metadata_selection_prompts.jsonl
+  raw_vlm_metadata_selection.jsonl
+  predictions.jsonl
+  metadata_only_report.md
+```
+
+官方评估：
+
+```json
+{
+  "paper_precision_macro": 0.7445454545454546,
+  "paper_recall_macro": 0.5636363636363636,
+  "paper_f1_macro": 0.6009090909090908,
+  "evidence_precision_macro": 0.0,
+  "evidence_recall_macro": 0.0,
+  "evidence_f1_macro": 0.0,
+  "multiple_choice_accuracy": 0.0,
+  "freeform_exact_match": 0.0,
+  "table_row_f1_macro": 0.0,
+  "table_cell_accuracy_micro": 0.0
+}
+```
+
+该结果说明 metadata-only paper selection 可作为 retrieval/paper-selection 诊断基线，但不能反映 evidence 或 answer 能力。
+
+## Retrieval 结论
+
+当前 generic `hybrid_alias` 是无 topic hint 的通用检索器。`pdf_vlm_symbolic_vlm_baseline` 内置了一个 opt-in 的 topic-profile expansion，用于在所有官方 metadata 上做显式 topic 标注和打分；它不依赖其他 baseline 的代码。
+
+当前实现中：
+
+```env
+RETRIEVAL_ENABLE_TOPIC_EXPANSION=false
+```
+
+默认关闭 topic profile。显式开启时可作为上限/消融实验：
+
+```bash
+RETRIEVAL_ENABLE_TOPIC_EXPANSION=true ...
+```
+
+Topic profile 属于 task/dev-set-oriented retrieval hint，不应混入默认 generic baseline。
+
+## 当前核心瓶颈
+
+当前最重要的观察是：**纯 symbolic 层对上下文质量影响过大。**
+
+现有结构中，VLM-2 主要依赖 selected symbolic records 作为上下文。如果上游任一环节失真，VLM-2 就无法恢复信息：
+
+```text
+metadata retrieval miss -> wrong papers enter downstream
+page routing miss -> VLM-1 never sees key page
+VLM-1 transcription loss -> symbolic record 缺失关键值
+symbolic validation/normalization -> 信息可能被简化或重排
+symbolic context selector miss -> VLM-2 看不到正确 record
+VLM-2 over symbolic text -> 对复杂表格/figure/citation 的语义恢复能力受限
+```
+
+换句话说，symbolic layer 带来了审计性和可控性，但当它成为 VLM-2 的主要上下文来源时，会放大 page routing、transcription 和 selection 的误差。
+
+## 下一阶段 Baseline 方向
+
+下一轮 baseline 应研究：
+
+```text
+VLM-1 + symbolic layer = hints / anchors / provenance
+not the primary context source
+```
+
+也就是说，不再让 VLM-2 只依赖 selected symbolic text。新的设计应考虑：
+
+```text
+metadata candidates
++ routed pages or cropped evidence context
++ VLM-1 symbolic records as structured hints
++ page/source/label/table_id/figure_id/equation_id anchors
+-> VLM-2 answer generation
+```
+
+预期目标：
+
+1. 保留 symbolic layer 的 auditability。
+2. 降低 VLM-1 transcription loss 对答案的硬性影响。
+3. 让 symbolic records 主要承担定位、类型、标签和 provenance 提示。
+4. 允许 VLM-2 利用更接近原始证据的上下文完成最终推理。
+5. 继续禁止将 retrieval score、selector score、bbox、parser confidence、gold answer 或 gold evidence 送入 VLM。

@@ -8,11 +8,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from PIL import Image
-
 from .config import load_pipeline_config, model_slug
-from .data_io import append_jsonl, find_official_file, read_jsonl, write_jsonl
+from .data_io import append_jsonl, extract_answer_contract, find_official_file, read_jsonl, write_jsonl
 from .metadata_index import HYBRID_SCORE_WEIGHTS, build_metadata_records, retrieve_candidates
+from .metadata_selection import (
+    build_metadata_selection_messages,
+    empty_metadata_prediction,
+    normalize_metadata_selection,
+    selection_candidates_for_metadata_vlm,
+)
 from .openreview_filter import filter_openreview_metadata
 from .page_ranker import build_global_page_pool, rank_global_pages_for_query
 from .parser import extract_json_object, make_fallback_prediction, normalize_prediction, strip_internal_grounding, validate_prediction_shape
@@ -22,6 +26,8 @@ from .pdf_page_renderer import render_pdf_pages
 from .symbolic_context_selector import select_symbolic_contexts
 from .symbolic_index import build_symbolic_index
 from .symbolic_validator import migrate_legacy_record_to_runtime, normalize_page_records, to_runtime_record, validate_page_structure
+from .sync_symbolic_run_to_processed import sync_symbolic_run_to_processed
+from .topic_expansion import expand_candidates_with_topic_profiles
 from .vlm_answer_client import VLMAnswerClient
 from .vlm_answer_prompt_builder import build_symbolic_answer_prompt
 from .vlm_parser_client import VLMParserClient
@@ -73,13 +79,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--vlm2-context-mode", choices=["text_only", "cropped_image"], default=None)
     p.add_argument("--vlm2-include-parse-confidence", dest="vlm2_include_parse_confidence", action="store_true", default=None)
     p.add_argument("--vlm2-no-parse-confidence", dest="vlm2_include_parse_confidence", action="store_false")
-    p.add_argument("--metadata-only-eval-freeze", action="store_true", help="Skip PDF/VLM stages and write retrieval-only predictions for fast retrieval evaluation.")
+    p.add_argument("--metadata-only-eval-freeze", action="store_true", help="Skip PDF/VLM-1/symbolic stages and use VLM-2 to select gold_papers from top-k metadata candidates.")
     p.add_argument("--page-routing-enabled", dest="page_routing_enabled", action="store_true", default=None)
     p.add_argument("--no-page-routing", dest="page_routing_enabled", action="store_false")
     p.add_argument("--page-routing-top-pages-global", type=int, default=None)
     p.add_argument("--page-routing-max-pages-global", type=int, default=None)
     p.add_argument("--page-routing-parse-batch-size", type=int, default=None)
     p.add_argument("--page-routing-expansion-step-global", type=int, default=None)
+    p.add_argument("--no-sync-processed-run-store", dest="sync_processed_run_store", action="store_false", default=True)
     return p.parse_args()
 
 
@@ -102,6 +109,8 @@ def _paths(output_dir: Path, resume: bool, dry_run: bool, skip_generation: bool)
         "selected_contexts_prompt": "selected_symbolic_contexts.prompt.jsonl",
         "raw_parser": "raw_vlm_parser_responses.jsonl",
         "raw_answer": "raw_vlm_answer_responses.jsonl",
+        "metadata_selection_prompts": "metadata_selection_prompts.jsonl",
+        "raw_metadata_selection": "raw_vlm_metadata_selection.jsonl",
         "prompt_previews": "prompt_previews.jsonl",
         "errors": "errors.jsonl",
         "report": "run_report.md",
@@ -466,34 +475,6 @@ def _effective_vlm2_context_mode(requested_mode: str, answer_supports_images: bo
     return requested_mode
 
 
-def _make_crop(
-    *,
-    image_path: str,
-    bbox_1000: list[Any] | None,
-    output_path: Path,
-) -> bool:
-    if not bbox_1000 or len(bbox_1000) != 4:
-        return False
-    try:
-        with Image.open(image_path) as image:
-            image = image.convert("RGB")
-            width, height = image.size
-            x1, y1, x2, y2 = [float(v) for v in bbox_1000]
-            box = (
-                max(0, min(width, int(round(x1 * width / 1000)))),
-                max(0, min(height, int(round(y1 * height / 1000)))),
-                max(0, min(width, int(round(x2 * width / 1000)))),
-                max(0, min(height, int(round(y2 * height / 1000)))),
-            )
-            if box[0] >= box[2] or box[1] >= box[3]:
-                return False
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            image.crop(box).save(output_path, format="JPEG", quality=90, optimize=True)
-        return True
-    except Exception:
-        return False
-
-
 def _attach_vlm2_images(
     selected: dict[str, Any],
     mode: str,
@@ -506,24 +487,22 @@ def _attach_vlm2_images(
         return [], selected
     image_paths: list[str] = []
     attached_refs: list[str] = []
-    crop_dir = output_dir / "vlm2_crops" / str(selected.get("query_id") or "query")
     for evidence, debug in zip(selected.get("selected_evidence", []), selected.get("selected_records_debug", [])):
         image_ref = evidence.get("image_ref")
-        image_path = debug.get("image_path")
         if debug.get("source_type") not in {"table", "figure", "equation_algorithm"}:
             evidence.pop("image_ref", None)
             continue
-        if not image_ref or not image_path:
+        if not image_ref:
             evidence.pop("image_ref", None)
             continue
-        crop_path = crop_dir / f"{image_ref}.jpg"
-        if _make_crop(image_path=str(image_path), bbox_1000=debug.get("bbox_1000"), output_path=crop_path):
+        precomputed_crop = debug.get("figure_crop_path")
+        if precomputed_crop and Path(str(precomputed_crop)).exists():
             attached_refs.append(str(image_ref))
-            image_paths.append(str(crop_path))
-        else:
-            evidence.pop("image_ref", None)
-            append_jsonl(paths["errors"], {"query_id": selected.get("query_id"), "type": "vlm2_crop_generation_failed", "record_id": debug.get("record_id")})
-            stats["vlm2_crop_failures"] += 1
+            image_paths.append(str(precomputed_crop))
+            continue
+        evidence.pop("image_ref", None)
+        append_jsonl(paths["errors"], {"query_id": selected.get("query_id"), "type": "vlm2_precomputed_crop_missing", "record_id": debug.get("record_id")})
+        stats["vlm2_crop_failures"] += 1
     selected["attached_image_refs"] = attached_refs
     stats["vlm2_attached_image_count"] += len(image_paths)
     return image_paths, selected
@@ -541,6 +520,44 @@ def _prompt_context_stats(selected_prompt: dict[str, Any], stats: dict[str, Any]
     count = max(1, int(stats["vlm2_prompt_evidence_record_count"]))
     stats["average_prompt_evidence_fields_per_record"] = round(stats["vlm2_prompt_evidence_field_total"] / count, 3)
     stats["average_prompt_evidence_chars_per_record"] = round(stats["vlm2_prompt_evidence_char_total"] / count, 3)
+    for source_type, count_value in (selected_prompt.get("source_type_distribution") or {}).items():
+        stats["selected_evidence_source_type_distribution"][str(source_type)] = (
+            int(stats["selected_evidence_source_type_distribution"].get(str(source_type), 0)) + int(count_value or 0)
+        )
+    stats["primary_evidence_selected_count"] += int(selected_prompt.get("primary_evidence_type_count") or 0)
+    stats["supporting_evidence_selected_count"] += int(selected_prompt.get("supporting_evidence_count") or 0)
+    for label_type, count_value in (selected_prompt.get("grounding_label_hints_by_type") or {}).items():
+        stats["grounding_label_hints_by_type"][str(label_type)] = (
+            int(stats["grounding_label_hints_by_type"].get(str(label_type), 0)) + int(count_value or 0)
+        )
+
+
+def _update_answer_contract_stats(answer_contract: dict[str, Any], stats: dict[str, Any], query_id: str, paths: dict[str, Path]) -> None:
+    answer_types = answer_contract.get("answer_types") or []
+    if "multiple_choice" not in answer_types:
+        return
+    stats["multiple_choice_queries_count"] += 1
+    options = (answer_contract.get("multiple_choice") or {}).get("options") or []
+    if options:
+        stats["multiple_choice_options_available_count"] += 1
+    else:
+        stats["multiple_choice_options_missing_count"] += 1
+        append_jsonl(paths["errors"], {"query_id": query_id, "type": "missing_multiple_choice_options"})
+
+
+def _update_normalization_error_stats(errors: list[dict[str, Any]], stats: dict[str, Any]) -> None:
+    for error in errors:
+        error_type = str(error.get("type") or "")
+        if error_type == "invalid_multiple_choice_option":
+            stats["invalid_multiple_choice_outputs_count"] += 1
+        elif error_type == "answer_type_extra_fields_removed":
+            stats["answer_type_extra_fields_removed_count"] += 1
+        elif error_type == "missing_required_answer_type":
+            stats["answer_type_missing_required_count"] += 1
+        elif error_type == "invented_grounding_label_removed":
+            stats["invented_grounding_labels_removed_count"] += 1
+        elif error_type == "locator_validation_error":
+            stats["locator_validation_errors_count"] += 1
 
 
 def _empty_answer_for_sample(sample: dict[str, Any]) -> dict[str, Any]:
@@ -555,15 +572,32 @@ def _empty_answer_for_sample(sample: dict[str, Any]) -> dict[str, Any]:
     return answer
 
 
-def _metadata_only_prediction(sample: dict[str, Any], candidates: list[dict[str, Any]]) -> dict[str, Any]:
-    top = candidates[0] if candidates else {}
-    paper_id = str(top.get("paper_id") or "")
-    return {
-        "query_id": sample.get("query_id"),
-        "gold_papers": [{"paper_id": paper_id}] if paper_id else [],
-        "evidence": [],
-        "answer": _empty_answer_for_sample(sample),
-    }
+def _metadata_only_vlm_prediction(
+    sample: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    answer_client: VLMAnswerClient,
+    paths: dict[str, Path],
+    stats: dict[str, Any],
+    selection_policy: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    query_id = str(sample.get("query_id") or "")
+    messages = build_metadata_selection_messages(sample, candidates)
+    append_jsonl(paths["metadata_selection_prompts"], {"query_id": query_id, "selection_policy": selection_policy or {}, "messages": messages})
+    stats["vlm2_metadata_selection_calls"] += 1
+    try:
+        result = answer_client.generate_prediction(messages, image_paths=None)
+        append_jsonl(paths["raw_metadata_selection"], {"query_id": query_id, "content": result["content"], "raw_response": result["raw_response"]})
+        selected = extract_json_object(str(result["content"]))
+        prediction, errors = normalize_metadata_selection(selected, sample, candidates)
+        for error in errors:
+            if error.get("type") == "metadata_vlm_no_valid_papers_selected":
+                stats["vlm2_metadata_no_valid_selection_count"] += 1
+            append_jsonl(paths["errors"], error)
+        return prediction
+    except Exception as exc:
+        stats["vlm2_metadata_selection_failures"] += 1
+        append_jsonl(paths["errors"], {"query_id": query_id, "type": "metadata_vlm_selection_failure", "error": str(exc)})
+        return empty_metadata_prediction(sample)
 
 
 def _update_retrieval_coverage(sample: dict[str, Any], candidates: list[dict[str, Any]], stats: dict[str, Any]) -> None:
@@ -945,6 +979,8 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- task_family_budget_usage: `{stats.get('task_family_budget_usage', {})}`",
         f"- retrieval method: `{stats.get('retrieval_method')}`",
         f"- retrieval enable topic expansion: {stats.get('retrieval_enable_topic_expansion')}",
+        f"- retrieval enable query decomposition: {stats.get('retrieval_enable_query_decomposition')}",
+        f"- retrieval subquery top-k: {stats.get('retrieval_subquery_top_k')}",
         f"- retrieval score boost settings: `{stats.get('retrieval_score_boost_settings')}`",
         f"- top-k retrieval candidate coverage: {stats.get('top_k_retrieval_candidate_coverage', 'unavailable')}",
         f"- top_n_records: {stats.get('top_n_records')}",
@@ -1038,6 +1074,10 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- answer model: `{stats.get('answer_model')}`",
         f"- answer model image input capability: {stats.get('answer_supports_images')}",
         f"- metadata-only eval freeze: {stats.get('metadata_only_eval_freeze')}",
+        f"- metadata-only eval freeze mode: `{stats.get('metadata_only_eval_freeze_mode')}`",
+        f"- vlm2 metadata selection calls: {stats.get('vlm2_metadata_selection_calls', 0)}",
+        f"- vlm2 metadata selection failures: {stats.get('vlm2_metadata_selection_failures', 0)}",
+        f"- vlm2 metadata no-valid-selection count: {stats.get('vlm2_metadata_no_valid_selection_count', 0)}",
         f"- vlm2_context_mode: `{stats.get('vlm2_context_mode')}`",
         f"- vlm2_effective_context_mode: `{stats.get('vlm2_effective_context_mode')}`",
         f"- vlm2_context_mode_downgraded: {stats.get('vlm2_context_mode_downgraded')}",
@@ -1050,6 +1090,21 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- vlm2_include_parse_confidence: {stats.get('vlm2_include_parse_confidence')}",
         f"- vlm2_attached_image_count: {stats.get('vlm2_attached_image_count', 0)}",
         f"- vlm2_crop_failures: {stats.get('vlm2_crop_failures', 0)}",
+        f"- answer_contract_enabled: {stats.get('answer_contract_enabled')}",
+        f"- multiple_choice_queries_count: {stats.get('multiple_choice_queries_count', 0)}",
+        f"- multiple_choice_options_available_count: {stats.get('multiple_choice_options_available_count', 0)}",
+        f"- multiple_choice_options_missing_count: {stats.get('multiple_choice_options_missing_count', 0)}",
+        f"- invalid_multiple_choice_outputs_count: {stats.get('invalid_multiple_choice_outputs_count', 0)}",
+        f"- answer_type_extra_fields_removed_count: {stats.get('answer_type_extra_fields_removed_count', 0)}",
+        f"- answer_type_missing_required_count: {stats.get('answer_type_missing_required_count', 0)}",
+        f"- official_source_type_constraint_enabled: {stats.get('official_source_type_constraint_enabled')}",
+        f"- selected_evidence_source_type_distribution: `{stats.get('selected_evidence_source_type_distribution', {})}`",
+        f"- primary_evidence_selected_count: {stats.get('primary_evidence_selected_count', 0)}",
+        f"- supporting_evidence_selected_count: {stats.get('supporting_evidence_selected_count', 0)}",
+        f"- grounding_label_hints_enabled: {stats.get('grounding_label_hints_enabled')}",
+        f"- grounding_label_hints_by_type: `{stats.get('grounding_label_hints_by_type', {})}`",
+        f"- invented_grounding_labels_removed_count: {stats.get('invented_grounding_labels_removed_count', 0)}",
+        f"- locator_validation_errors_count: {stats.get('locator_validation_errors_count', 0)}",
         f"- answer API calls: {stats.get('answer_api_calls', 0)}",
         f"- partial artifacts used in answer generation: {stats.get('partial_artifacts_used_in_answer_generation', 0)}",
         f"- successful predictions: {stats.get('successful_predictions', 0)}",
@@ -1062,7 +1117,19 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- symbolic_records.debug 路径: `{stats.get('symbolic_records_debug_path')}`",
         f"- selected_symbolic_contexts.debug 路径: `{stats.get('selected_contexts_debug_path')}`",
         f"- selected_symbolic_contexts.prompt 路径: `{stats.get('selected_contexts_prompt_path')}`",
+        f"- processed symbolic store 路径: `{stats.get('processed_symbolic_store_path', '')}`",
+        f"- processed symbolic store runtime records: {stats.get('processed_symbolic_store_runtime_records', 0)}",
+        f"- processed symbolic store debug records: {stats.get('processed_symbolic_store_debug_records', 0)}",
+        f"- processed symbolic store sync error: `{stats.get('processed_symbolic_store_sync_error', '')}`",
         f"- evaluator 命令: `python -m pdf_vlm_symbolic_vlm_baseline.evaluate_local --official-dir official_dev --pred {stats.get('predictions_path')}`",
+        "",
+        "## VLM-2 约束说明",
+        "",
+        "- VLM-2 receives multiple-choice options from sanitized validation answer constraints when available.",
+        "- VLM-2 does not receive gold answers, gold evidence, or gold paper ids.",
+        "- VLM-2 selected evidence is constrained to official source types.",
+        "- VLM-2 receives both primary evidence type records and supporting context records.",
+        "- Grounding labels are passed only when extracted from visible symbolic records or deterministic native text, not invented.",
         "",
         "## 当前落盘 JSONL 行数",
         "",
@@ -1092,7 +1159,9 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         "- 第一层 VLM 是 document-to-symbol converter。",
         "- 中间 symbolic system 负责 schema validation、locator echo、artifact indexing 和 provenance。",
         "- 第二层 VLM 只基于 selected symbolic contexts 和可选图像生成答案。",
-        "- VLM-1 does not generate bbox in the evaluator-grounded minimal schema.",
+        "- VLM-1 main transcription does not generate bbox in the evaluator-grounded minimal schema.",
+        "- Figure bbox is generated only by the figure-localization pass for crop creation and debug audit; runtime symbolic records keep crop paths, not bbox.",
+        "- processed_pdfs/vlm_symbolic_runs is the durable symbolic store; outputs/ is run-level audit and prediction output.",
         "- 当前 symbolic system 是最小 JSONL-based symbolic layer，不是完整 KG。",
         "- context selection 使用 lexical / BM25 over symbolic records，不使用 embedding。",
         "- metadata top-k retrieval 的 recall 限制整个 pipeline 上限。",
@@ -1114,7 +1183,7 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         "- The system does not enforce a per-paper selected page quota.",
         "- A paper may contribute zero, one, or many selected pages depending on global page scores.",
         "- VLM-1 is called only on selected pages unless fallback mode is triggered.",
-        "- VLM-2 still receives only selected symbolic evidence, not full page images.",
+        "- VLM-2 still receives only selected symbolic evidence and precomputed crop images when enabled, never full page images.",
     ]
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -1154,9 +1223,15 @@ def main() -> int:
     page_routing_expansion_step_global = args.page_routing_expansion_step_global or config.page_routing_expansion_step_global
     requested_vlm2_context_mode = args.vlm2_context_mode or config.vlm2_context_mode
     include_parse_confidence = False
-    fields_removed_from_vlm2_prompt = ["global_record_id", "record_type", "record_id", "label", "image_path", "score", "bbox_1000", "vlm_parse_confidence"]
+    fields_removed_from_vlm2_prompt = ["global_record_id", "record_type", "record_id", "locator", "image_path", "score", "bbox_1000", "vlm_parse_confidence"]
 
     inputs = read_jsonl(find_official_file(args.official_dir, "validation_inputs.jsonl"))
+    validation_contract_rows = read_jsonl(find_official_file(args.official_dir, "validation.jsonl"))
+    validation_contract_by_query_id = {
+        str(row.get("query_id") or ""): row
+        for row in validation_contract_rows
+        if row.get("query_id")
+    }
     if args.max_queries is not None:
         inputs = inputs[: args.max_queries]
     metadata = build_metadata_records(read_jsonl(find_official_file(args.official_dir, "paper_metadata.jsonl")))
@@ -1187,6 +1262,8 @@ def main() -> int:
         "effective_page_routing_top_pages_per_candidate_distribution": {},
         "retrieval_method": config.retrieval_method,
         "retrieval_enable_topic_expansion": config.retrieval_enable_topic_expansion,
+        "retrieval_enable_query_decomposition": config.retrieval_enable_query_decomposition,
+        "retrieval_subquery_top_k": config.retrieval_subquery_top_k,
         "retrieval_score_boost_settings": HYBRID_SCORE_WEIGHTS if config.retrieval_method == "hybrid_alias" else {},
         "top_k_retrieval_candidate_coverage": "unavailable",
         "top_k_retrieval_coverage_hits": 0,
@@ -1279,6 +1356,10 @@ def main() -> int:
         "answer_model": config.answer_model,
         "answer_supports_images": answer_client.supports_image_input(),
         "metadata_only_eval_freeze": args.metadata_only_eval_freeze,
+        "metadata_only_eval_freeze_mode": "vlm2_metadata_paper_selection" if args.metadata_only_eval_freeze else "",
+        "vlm2_metadata_selection_calls": 0,
+        "vlm2_metadata_selection_failures": 0,
+        "vlm2_metadata_no_valid_selection_count": 0,
         "vlm2_context_mode": requested_vlm2_context_mode,
         "vlm2_effective_context_mode": _effective_vlm2_context_mode(requested_vlm2_context_mode, answer_client.supports_image_input(), {}),
         "vlm2_context_mode_downgraded": False,
@@ -1294,6 +1375,21 @@ def main() -> int:
         "vlm2_prompt_evidence_char_total": 0,
         "vlm2_attached_image_count": 0,
         "vlm2_crop_failures": 0,
+        "answer_contract_enabled": True,
+        "multiple_choice_queries_count": 0,
+        "multiple_choice_options_available_count": 0,
+        "multiple_choice_options_missing_count": 0,
+        "invalid_multiple_choice_outputs_count": 0,
+        "answer_type_extra_fields_removed_count": 0,
+        "answer_type_missing_required_count": 0,
+        "official_source_type_constraint_enabled": True,
+        "selected_evidence_source_type_distribution": {},
+        "primary_evidence_selected_count": 0,
+        "supporting_evidence_selected_count": 0,
+        "grounding_label_hints_enabled": True,
+        "grounding_label_hints_by_type": {},
+        "invented_grounding_labels_removed_count": 0,
+        "locator_validation_errors_count": 0,
         "answer_api_calls": 0,
         "successful_predictions": 0,
         "parse_failures": 0,
@@ -1312,6 +1408,13 @@ def main() -> int:
     stats["vlm2_effective_context_mode"] = effective_vlm2_context_mode
 
     paper_records_cache: dict[str, list[dict[str, Any]]] = {}
+    completed_query_ids: set[str] = set()
+    if args.resume and paths["predictions"].exists():
+        for row in read_jsonl(paths["predictions"]):
+            query_id_value = str(row.get("query_id") or "")
+            if query_id_value:
+                completed_query_ids.add(query_id_value)
+        stats["resume_completed_query_count"] = len(completed_query_ids)
     exit_code = 0
     try:
         iterator = inputs
@@ -1319,13 +1422,29 @@ def main() -> int:
             iterator = tqdm(inputs, desc="queries", unit="query")  # type: ignore[assignment]
         for sample in iterator:
             query_id = str(sample.get("query_id", ""))
+            if query_id in completed_query_ids:
+                stats["resume_skipped_completed_queries"] = int(stats.get("resume_skipped_completed_queries") or 0) + 1
+                continue
+            answer_contract = extract_answer_contract(sample, validation_contract_by_query_id.get(query_id))
+            _update_answer_contract_stats(answer_contract, stats, query_id, paths)
             budget = _query_budget(sample, config, args.top_k_papers)
             effective_top_k = int(budget["top_k_papers"])
             effective_pages_per_candidate = int(budget["page_routing_top_pages_per_candidate"])
             _increment_counter_stat(stats, "task_family_budget_usage", budget["task_family_bucket"])
             _increment_counter_stat(stats, "effective_top_k_distribution", effective_top_k)
             _increment_counter_stat(stats, "effective_page_routing_top_pages_per_candidate_distribution", effective_pages_per_candidate)
-            candidates = retrieve_candidates(str(sample.get("question", "")), metadata, effective_top_k, method=config.retrieval_method)
+            candidates = retrieve_candidates(
+                str(sample.get("question", "")),
+                metadata,
+                effective_top_k,
+                method=config.retrieval_method,
+                enable_query_decomposition=config.retrieval_enable_query_decomposition and budget["task_family_bucket"] == "multi_paper",
+                subquery_top_k=config.retrieval_subquery_top_k,
+            )
+            topic_info = None
+            if config.retrieval_enable_topic_expansion:
+                candidates, topic_info = expand_candidates_with_topic_profiles(sample, candidates, metadata, effective_top_k)
+            metadata_selection_candidates, metadata_selection_policy = selection_candidates_for_metadata_vlm(candidates)
             query_top_pages_global = explicit_top_pages_global or max(1, effective_pages_per_candidate * len(candidates))
             query_max_pages_global = max(page_routing_max_pages_global, query_top_pages_global)
             _increment_counter_stat(stats, "effective_top_p_distribution", query_top_pages_global)
@@ -1341,13 +1460,26 @@ def main() -> int:
                     "effective_top_k_papers": effective_top_k,
                     "effective_page_routing_top_pages_per_candidate": effective_pages_per_candidate,
                     "effective_top_p_pages": query_top_pages_global,
+                    "topic_expansion": topic_info,
+                    "metadata_selection_policy": metadata_selection_policy,
+                    "metadata_selection_candidates": metadata_selection_candidates,
                     "candidates": candidates,
                 },
             )
             if args.metadata_only_eval_freeze:
-                append_jsonl(paths["predictions"], _metadata_only_prediction(sample, candidates))
+                failure_count_before = int(stats.get("vlm2_metadata_selection_failures") or 0)
+                prediction = _metadata_only_vlm_prediction(
+                    sample,
+                    metadata_selection_candidates,
+                    answer_client,
+                    paths,
+                    stats,
+                    metadata_selection_policy,
+                )
+                append_jsonl(paths["predictions"], prediction)
                 stats["processed_queries"] += 1
-                stats["successful_predictions"] += 1
+                if int(stats.get("vlm2_metadata_selection_failures") or 0) == failure_count_before:
+                    stats["successful_predictions"] += 1
                 _write_report_from_paths(paths, stats)
                 continue
             availability = ensure_candidate_pdfs(
@@ -1505,6 +1637,11 @@ def main() -> int:
                 query_id,
                 effective_vlm2_context_mode,
                 include_parse_confidence,
+                evidence_total_budget=config.vlm2_evidence_total_budget,
+                primary_evidence_min=config.vlm2_primary_evidence_min,
+                support_text_min=config.vlm2_support_text_min,
+                context_types_enabled=config.vlm2_context_types_enabled,
+                context_type_budget_per_type=config.vlm2_context_type_budget_per_type,
             )
             if page_routing_enabled and routing_result is not None and config.page_routing_enable_progressive_expansion:
                 ranked_pages = list(routing_result.get("ranked_pages") or [])
@@ -1584,6 +1721,11 @@ def main() -> int:
                         query_id,
                         effective_vlm2_context_mode,
                         include_parse_confidence,
+                        evidence_total_budget=config.vlm2_evidence_total_budget,
+                        primary_evidence_min=config.vlm2_primary_evidence_min,
+                        support_text_min=config.vlm2_support_text_min,
+                        context_types_enabled=config.vlm2_context_types_enabled,
+                        context_type_budget_per_type=config.vlm2_context_type_budget_per_type,
                     )
             if page_routing_enabled and routing_result is not None:
                 total_pages = int(routing_result.get("total_candidate_pages") or 0)
@@ -1615,6 +1757,10 @@ def main() -> int:
                 "selection_method": selected.get("selection_method"),
                 "prompt_context_mode": selected.get("prompt_context_mode"),
                 "has_partial_artifacts": selected.get("has_partial_artifacts", False),
+                "source_type_distribution": selected.get("source_type_distribution", {}),
+                "primary_evidence_type_count": selected.get("primary_evidence_type_count", 0),
+                "supporting_evidence_count": selected.get("supporting_evidence_count", 0),
+                "grounding_label_hints_by_type": selected.get("grounding_label_hints_by_type", {}),
                 "selected_records": selected.get("selected_records_debug", []),
                 "selected_visual_records": selected.get("selected_visual_records", []),
             }
@@ -1623,6 +1769,10 @@ def main() -> int:
                 "selected_evidence": selected.get("selected_evidence", []),
                 "has_partial_artifacts": selected.get("has_partial_artifacts", False),
                 "attached_image_refs": selected.get("attached_image_refs", []),
+                "source_type_distribution": selected.get("source_type_distribution", {}),
+                "primary_evidence_type_count": selected.get("primary_evidence_type_count", 0),
+                "supporting_evidence_count": selected.get("supporting_evidence_count", 0),
+                "grounding_label_hints_by_type": selected.get("grounding_label_hints_by_type", {}),
             }
             if selected_prompt["selected_evidence"]:
                 stats["vlm2_prompt_context_fields"] = sorted(
@@ -1638,7 +1788,7 @@ def main() -> int:
             )
             append_jsonl(paths["selected_contexts_debug"], selected_debug)
             append_jsonl(paths["selected_contexts_prompt"], selected_prompt)
-            messages = build_symbolic_answer_prompt(sample, candidates, selected, answer_client.supports_image_input(), config.parser_model, config.answer_model)
+            messages = build_symbolic_answer_prompt(sample, candidates, selected, answer_client.supports_image_input(), config.parser_model, config.answer_model, answer_contract)
             append_jsonl(paths["prompt_previews"], {"query_id": query_id, "messages": messages, "baseline_type": BASELINE_TYPE})
             stats["processed_queries"] += 1
             if args.dry_run or args.skip_generation:
@@ -1657,7 +1807,14 @@ def main() -> int:
                 append_jsonl(paths["raw_answer"], {"query_id": query_id, "content": result["content"], "raw_response": result["raw_response"]})
                 internal = extract_json_object(str(result["content"]))
                 append_jsonl(paths["internal_predictions"], internal)
-                prediction, errors = normalize_prediction(internal, sample, [str(c.get("paper_id")) for c in candidates])
+                prediction, errors = normalize_prediction(
+                    internal,
+                    sample,
+                    [str(c.get("paper_id")) for c in candidates],
+                    answer_contract=answer_contract,
+                    selected_evidence=selected_prompt.get("selected_evidence", []),
+                )
+                _update_normalization_error_stats(errors, stats)
                 for error in errors:
                     append_jsonl(paths["errors"], error)
                 if not validate_prediction_shape(prediction):
@@ -1684,6 +1841,22 @@ def main() -> int:
         exit_code = 1
     finally:
         _write_report_from_paths(paths, stats)
+        if args.sync_processed_run_store and not args.metadata_only_eval_freeze:
+            try:
+                processed_run_root = Path(args.processed_output_dir).parent / "vlm_symbolic_runs"
+                manifest = sync_symbolic_run_to_processed(
+                    baseline_output_dir=output_dir,
+                    processed_output_dir=args.processed_output_dir,
+                    processed_run_root=processed_run_root,
+                    env_path=args.env_path,
+                )
+                stats["processed_symbolic_store_path"] = manifest.get("baseline_symbolic_root")
+                stats["processed_symbolic_store_runtime_records"] = manifest.get("runtime_record_count")
+                stats["processed_symbolic_store_debug_records"] = manifest.get("debug_record_count")
+            except Exception as sync_exc:
+                stats["processed_symbolic_store_sync_error"] = str(sync_exc)
+                append_jsonl(paths["errors"], {"type": "processed_symbolic_store_sync_error", "error": str(sync_exc)})
+            _write_report_from_paths(paths, stats)
         print(json.dumps(stats, ensure_ascii=False, indent=2))
     return exit_code
 

@@ -78,17 +78,34 @@ NON_METHOD_TERMS = {
     "aime",
     "alpacaeval",
     "ap",
+    "arkitscenes",
+    "bench2drive",
     "cifar10",
     "coco",
+    "dfid",
     "fid",
+    "geneval",
     "gpu",
+    "hypersim",
     "imagenet",
+    "ipc",
+    "kit",
+    "kitti",
     "llava1",
     "llm",
+    "modelnet40",
+    "naturalq",
+    "nuscenes",
+    "objectron",
     "pope",
     "qwen",
     "rgbd",
+    "rtdetrv2r50",
+    "studentt",
+    "sun",
+    "tinyimagenet",
     "vlm",
+    "vlmbased",
 }
 HYBRID_SCORE_WEIGHTS = {
     "title_bm25": 3.2,
@@ -159,6 +176,25 @@ def extract_query_terms(question: str) -> set[str]:
     for match in re.finditer(r"\b(?:the|a|an)\s+([A-Z][A-Za-z0-9².-]{2,}(?:\s+[A-Z][A-Za-z0-9².-]{2,}){0,4})\s+paper\b", question or ""):
         terms.add(compact(match.group(1)))
     return {term for term in terms if term and term not in NON_METHOD_TERMS}
+
+
+def extract_query_mentions(question: str) -> list[str]:
+    mentions: list[str] = []
+    seen: set[str] = set()
+    for pattern in (METHOD_RE, MIXED_METHOD_RE):
+        for match in pattern.finditer(question or ""):
+            text = match.group(0).strip()
+            key = compact(text)
+            if len(key) < 3 or key in NON_METHOD_TERMS or key in seen:
+                continue
+            seen.add(key)
+            mentions.append(text)
+    for quoted in re.findall(r"['\"]([^'\"]{2,80})['\"]", question or ""):
+        key = compact(quoted)
+        if len(key) >= 3 and key not in NON_METHOD_TERMS and key not in seen:
+            seen.add(key)
+            mentions.append(quoted)
+    return mentions[:16]
 
 
 def venue_year_hints(question: str) -> tuple[set[str], set[str]]:
@@ -362,12 +398,73 @@ def retrieve_candidates(
     metadata_records: list[dict[str, Any]],
     top_k: int = 12,
     method: str = "hybrid_alias",
+    enable_query_decomposition: bool = False,
+    subquery_top_k: int = 4,
 ) -> list[dict[str, Any]]:
     if not tokenize(question):
         return []
     retriever = _get_retriever(metadata_records, method)
     candidates = retriever.retrieve(question, top_k)
+    if enable_query_decomposition and method in {"hybrid_alias", "hybrid_alias_decomposed"}:
+        candidates = _merge_decomposed_candidates(retriever, question, candidates, top_k, subquery_top_k)
     if not candidates and metadata_records:
         first = metadata_records[0]
         candidates.append(_candidate_from_record(first, 1, 0.0, method, {"fallback": True, "weighted_total": 0.0}))
     return candidates
+
+
+def _merge_decomposed_candidates(
+    retriever: _BaseRetriever,
+    question: str,
+    base_candidates: list[dict[str, Any]],
+    top_k: int,
+    subquery_top_k: int,
+) -> list[dict[str, Any]]:
+    mentions = extract_query_mentions(question)
+    if not mentions:
+        return base_candidates
+    merged: dict[str, dict[str, Any]] = {}
+    order = 0
+
+    def add(candidate: dict[str, Any], source: str, rank: int) -> None:
+        nonlocal order
+        paper_id = str(candidate.get("paper_id") or "")
+        if not paper_id:
+            return
+        order += 1
+        base_score = float(candidate.get("hybrid_score") or candidate.get("score") or candidate.get("bm25_score") or 0.0)
+        if source == "full_query":
+            merge_score = base_score + max(0, top_k + 1 - rank) * 2.0
+        else:
+            merge_score = base_score * 0.35 + max(0, subquery_top_k + 1 - rank) * 24.0
+        existing = merged.get(paper_id)
+        if existing is None:
+            copied = dict(candidate)
+            copied["retrieval_method"] = "hybrid_alias_decomposed"
+            copied["_merge_score"] = merge_score
+            copied["_first_seen"] = order
+            copied["retrieval_decomposition_sources"] = [{"source": source, "rank": rank, "score": base_score}]
+            merged[paper_id] = copied
+            return
+        existing["_merge_score"] = float(existing.get("_merge_score") or 0.0) + merge_score
+        existing.setdefault("retrieval_decomposition_sources", []).append({"source": source, "rank": rank, "score": base_score})
+
+    for rank, candidate in enumerate(base_candidates, start=1):
+        add(candidate, "full_query", rank)
+    for mention in mentions:
+        for rank, candidate in enumerate(retriever.retrieve(mention, max(1, subquery_top_k)), start=1):
+            add(candidate, mention, rank)
+
+    ranked = sorted(merged.values(), key=lambda item: (-float(item.get("_merge_score") or 0.0), int(item.get("_first_seen") or 0)))[:top_k]
+    for rank, candidate in enumerate(ranked, start=1):
+        candidate["rank"] = rank
+        candidate["retrieval_rank"] = rank
+        components = candidate.get("retrieval_score_components")
+        if isinstance(components, dict):
+            components["decomposition_enabled"] = True
+            components["decomposition_mentions"] = mentions
+            components["decomposition_merge_score"] = float(candidate.get("_merge_score") or 0.0)
+    for candidate in ranked:
+        candidate.pop("_merge_score", None)
+        candidate.pop("_first_seen", None)
+    return ranked

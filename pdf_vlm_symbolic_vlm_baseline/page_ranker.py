@@ -12,11 +12,37 @@ from .data_io import read_jsonl
 from .metadata_index import BM25Okapi, tokenize
 
 
+TABLE_ID_RE = re.compile(r"\b(?:Table|Tab\.)\s+([A-Za-z]*\d+[A-Za-z0-9.\-]*)", re.IGNORECASE)
+FIGURE_ID_RE = re.compile(r"\b(?:Figure|Fig\.)\s+([A-Za-z]*\d+[A-Za-z0-9.\-]*)", re.IGNORECASE)
+ALGORITHM_ID_RE = re.compile(r"\bAlgorithm\s+([A-Za-z]*\d+[A-Za-z0-9.\-]*)", re.IGNORECASE)
 TABLE_RE = re.compile(r"\b(?:Table|Tab\.)\s+[A-Za-z]*\d+[A-Za-z0-9.\-]*|\bablation\b|\bresults?\b|\bcomparison\b", re.IGNORECASE)
 FIGURE_RE = re.compile(r"\b(?:Figure|Fig\.)\s+[A-Za-z]*\d+[A-Za-z0-9.\-]*", re.IGNORECASE)
-EQUATION_RE = re.compile(r"\b(?:Equation|Eq\.|Algorithm|Theorem)\b|[=∑∏∫≤≥]", re.IGNORECASE)
+EQUATION_RE = re.compile(r"\b(?:Equation|Eq\.|Algorithm|Theorem|loss|objective|argmax|sum|minimize)\b|[=∑∏∫≤≥]", re.IGNORECASE)
 CITATION_RE = re.compile(r"\[[0-9,\-\s]+\]|\([A-Z][A-Za-z\-]+(?: et al\.)?,\s*20[0-9]{2}\)|\bReferences\b|\bRelated Work\b", re.IGNORECASE)
 SECTION_RE = re.compile(r"^\s*(?:[0-9]+\.?\s+)?(?:Abstract|Introduction|Method|Approach|Experiment|Results|Ablation|Analysis|Conclusion|References)\b", re.IGNORECASE | re.MULTILINE)
+
+ORDINAL_WORDS = {
+    "first": 1,
+    "second": 2,
+    "third": 3,
+    "fourth": 4,
+    "fifth": 5,
+    "sixth": 6,
+    "seventh": 7,
+    "eighth": 8,
+    "ninth": 9,
+    "tenth": 10,
+    "eleventh": 11,
+    "twelfth": 12,
+    "thirteenth": 13,
+    "fourteenth": 14,
+    "fifteenth": 15,
+    "sixteenth": 16,
+    "seventeenth": 17,
+    "eighteenth": 18,
+    "nineteenth": 19,
+    "twentieth": 20,
+}
 
 
 def _query_text(query_example: dict[str, Any]) -> str:
@@ -28,6 +54,138 @@ def _query_text(query_example: dict[str, Any]) -> str:
         json.dumps(query_example.get("table_schema") or "", ensure_ascii=False),
     ]
     return " ".join(part for part in parts if part)
+
+
+def _effective_source_type(sample: dict[str, Any]) -> str:
+    question = str(sample.get("question") or "")
+    primary_type = str(sample.get("primary_evidence_type") or "")
+    if FIGURE_ID_RE.search(question):
+        return "figure"
+    if TABLE_ID_RE.search(question) or re.search(r"\btable\b|\bcomparison table\b", question, re.IGNORECASE):
+        return "table"
+    if re.search(r"\b(?:equation|eq\.|algorithm)\s+\(?[A-Za-z0-9.\-]+\)?", question, re.IGNORECASE):
+        return "equation_algorithm"
+    return primary_type
+
+
+def _normalized_object_id(prefix: str, value: str | None) -> str | None:
+    if not value:
+        return None
+    value = value.strip().rstrip(".,;:")
+    if not re.search(r"\d", value):
+        return None
+    return f"{prefix} {value}"
+
+
+def _object_pattern(label: str, object_id: str | None, caption_only: bool = False) -> re.Pattern[str] | None:
+    if not object_id:
+        return None
+    _, _, value = object_id.partition(" ")
+    if not value:
+        return None
+    suffix = r"\s*:" if caption_only else r"\b"
+    return re.compile(rf"\b{re.escape(label)}\s*{re.escape(value)}{suffix}", re.IGNORECASE)
+
+
+def _question_targets(sample: dict[str, Any]) -> dict[str, Any]:
+    question = str(sample.get("question") or "")
+    lower = question.lower()
+    reference_id: int | None = None
+    match = re.search(r"\b(\d+)(?:st|nd|rd|th)?\s+reference\b|\breference\s*(?:number|#)?\s*(\d+)\b", lower)
+    if match:
+        reference_id = int(match.group(1) or match.group(2))
+    else:
+        for word, value in ORDINAL_WORDS.items():
+            if re.search(rf"\b{word}\s+reference\b", lower):
+                reference_id = value
+                break
+
+    equation_id: str | None = None
+    equation_match = re.search(r"\b(?:equation|eq\.)\s*\(?([A-Za-z0-9.\-]+)\)?", question, re.IGNORECASE)
+    if equation_match:
+        equation_id = equation_match.group(1).strip().rstrip(".,;:")
+
+    algorithm_id: str | None = None
+    algorithm_match = ALGORITHM_ID_RE.search(question)
+    if algorithm_match:
+        algorithm_id = algorithm_match.group(1).strip().rstrip(".,;:")
+
+    table_match = TABLE_ID_RE.search(question)
+    figure_match = FIGURE_ID_RE.search(question)
+    return {
+        "table_id": _normalized_object_id("Table", table_match.group(1) if table_match else None),
+        "figure_id": _normalized_object_id("Figure", figure_match.group(1) if figure_match else None),
+        "equation_id": equation_id,
+        "algorithm_id": _normalized_object_id("Algorithm", algorithm_id),
+        "reference_id": reference_id,
+        "last_reference": bool(re.search(r"\blast\s+reference\b|\bindex\s+of\s+the\s+last\s+reference\b", lower)),
+        "hardware": bool(re.search(r"\bhardware\b|\bgpu\b|\bconfigure\b|\bconfiguration\b", lower)),
+        "subfigure_count": bool(re.search(r"\bhow many\s+(?:subfigures|sub-figures|panels)\b|\bnumber of\s+(?:subfigures|sub-figures|panels)\b", lower)),
+    }
+
+
+def _reference_numbers(text: str) -> list[int]:
+    numbers: list[int] = []
+    for match in re.finditer(r"(?:^|\n|\s)\[(\d{1,3})\]\s+", text or ""):
+        try:
+            numbers.append(int(match.group(1)))
+        except ValueError:
+            continue
+    return numbers
+
+
+def _evidence_page_bonus(sample: dict[str, Any], text: str, page_number: int, total_pages: int) -> float:
+    source_type = _effective_source_type(sample)
+    targets = _question_targets(sample)
+    bonus = 0.0
+    if source_type == "table":
+        exact_caption = _object_pattern("Table", targets.get("table_id"), caption_only=True)
+        exact_mention = _object_pattern("Table", targets.get("table_id"), caption_only=False)
+        if exact_caption and exact_caption.search(text):
+            bonus += 70.0
+        elif exact_mention and exact_mention.search(text):
+            bonus += 35.0
+        elif TABLE_RE.search(text):
+            bonus += 8.0
+    elif source_type == "figure":
+        exact_caption = _object_pattern("Figure", targets.get("figure_id"), caption_only=True)
+        exact_mention = _object_pattern("Figure", targets.get("figure_id"), caption_only=False)
+        if exact_caption and exact_caption.search(text):
+            bonus += 80.0
+        elif exact_mention and exact_mention.search(text):
+            bonus += 30.0
+        elif FIGURE_RE.search(text):
+            bonus += 8.0
+        if targets.get("subfigure_count") and re.search(r"\([a-z]\)", text):
+            bonus += 8.0
+    elif source_type == "citation_context":
+        reference_numbers = _reference_numbers(text)
+        target_ref = targets.get("reference_id")
+        if isinstance(target_ref, int) and target_ref in reference_numbers:
+            bonus += 90.0
+        if targets.get("last_reference") and reference_numbers:
+            bonus += min(80.0, max(reference_numbers) * 1.15) + min(20.0, len(reference_numbers))
+        if re.search(r"\bReferences\b", text, re.IGNORECASE):
+            bonus += 12.0
+        elif reference_numbers:
+            bonus += 8.0
+        if total_pages:
+            bonus += 2.0 * (page_number / total_pages)
+    elif source_type == "text_span":
+        if targets.get("hardware") and re.search(r"\b(?:gpu|rtx|a100|h100|cuda|nvidia)\b", text, re.IGNORECASE):
+            bonus += 60.0
+        if re.search(r"\b(?:implementation|experiment|setup|configuration|hardware|overhead|efficiency)\b", text, re.IGNORECASE):
+            bonus += 6.0
+    elif source_type == "equation_algorithm":
+        algorithm_pattern = _object_pattern("Algorithm", targets.get("algorithm_id"), caption_only=False)
+        if algorithm_pattern and algorithm_pattern.search(text):
+            bonus += 70.0
+        equation_id = targets.get("equation_id")
+        if equation_id and re.search(rf"\(\s*{re.escape(str(equation_id))}\s*\)", text):
+            bonus += 70.0
+        elif re.search(r"\bAlgorithm\b|\bequation\b|\bloss\b|\bobjective\b|=", text, re.IGNORECASE):
+            bonus += 8.0
+    return bonus
 
 
 def _candidate_score_prior(candidate: dict[str, Any]) -> float:
@@ -114,7 +272,7 @@ def rank_global_pages_for_query(
     empty_text_parse_first_n_pages: int = 4,
 ) -> dict[str, Any]:
     query_id = str(query_example.get("query_id") or "")
-    primary_type = str(query_example.get("primary_evidence_type") or "")
+    primary_type = _effective_source_type(query_example)
     query = _query_text(query_example)
     pool = build_global_page_pool(candidates, paper_page_texts, query_id)
     if not pool:
@@ -190,6 +348,12 @@ def rank_global_pages_for_query(
         rule = _rule_boosts(text, primary_type)
         prior = _candidate_score_prior(row)
         position = _page_position_prior(int(row.get("page") or 0), page_count_by_paper[str(row.get("paper_id"))], primary_type)
+        evidence_bonus = _evidence_page_bonus(
+            query_example,
+            text,
+            page_number=int(row.get("page") or 0),
+            total_pages=page_count_by_paper[str(row.get("paper_id"))],
+        )
         components = {
             "native_text_bm25": float(bm25_score),
             "query_overlap": float(overlap),
@@ -198,6 +362,7 @@ def rank_global_pages_for_query(
             "label_match_boost": rule["label_match_boost"],
             "section_heading_boost": rule["section_heading_boost"],
             "page_position_prior": position,
+            "target_locator_bonus": evidence_bonus,
         }
         score = sum(float(value) for value in components.values())
         scored.append((score, {**row, "score": score, "score_components": components}))

@@ -46,8 +46,15 @@ class PipelineConfig:
     structured_cache_policy: str
     vlm2_context_mode: str
     vlm2_include_parse_confidence: bool
+    vlm2_evidence_total_budget: int
+    vlm2_primary_evidence_min: int
+    vlm2_support_text_min: int
+    vlm2_context_types_enabled: bool
+    vlm2_context_type_budget_per_type: int
     retrieval_method: str
     retrieval_enable_topic_expansion: bool
+    retrieval_enable_query_decomposition: bool
+    retrieval_subquery_top_k: int
     task_family_budget_enabled: bool
     single_paper_top_k_papers: int
     single_paper_page_routing_top_pages_per_candidate: int
@@ -140,8 +147,15 @@ def load_pipeline_config(env_path: str | Path = ".env") -> PipelineConfig:
         structured_cache_policy=get("STRUCTURED_CACHE_POLICY", "reuse_complete_only") or "reuse_complete_only",
         vlm2_context_mode=get("VLM2_CONTEXT_MODE", "text_only") or "text_only",
         vlm2_include_parse_confidence=get_bool("VLM2_INCLUDE_PARSE_CONFIDENCE", True),
+        vlm2_evidence_total_budget=int(get("VLM2_EVIDENCE_TOTAL_BUDGET", "24") or "24"),
+        vlm2_primary_evidence_min=int(get("VLM2_PRIMARY_EVIDENCE_MIN", "6") or "6"),
+        vlm2_support_text_min=int(get("VLM2_SUPPORT_TEXT_MIN", "4") or "4"),
+        vlm2_context_types_enabled=get_bool("VLM2_CONTEXT_TYPES_ENABLED", True),
+        vlm2_context_type_budget_per_type=int(get("VLM2_CONTEXT_TYPE_BUDGET_PER_TYPE", "3") or "3"),
         retrieval_method=get("RETRIEVAL_METHOD", "hybrid_alias") or "hybrid_alias",
         retrieval_enable_topic_expansion=get_bool("RETRIEVAL_ENABLE_TOPIC_EXPANSION", False),
+        retrieval_enable_query_decomposition=get_bool("RETRIEVAL_ENABLE_QUERY_DECOMPOSITION", True),
+        retrieval_subquery_top_k=int(get("RETRIEVAL_SUBQUERY_TOP_K", "4") or "4"),
         task_family_budget_enabled=get_bool("TASK_FAMILY_BUDGET_ENABLED", True),
         single_paper_top_k_papers=int(get("SINGLE_PAPER_TOP_K_PAPERS", "5") or "5"),
         single_paper_page_routing_top_pages_per_candidate=int(get("SINGLE_PAPER_PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE", "5") or "5"),

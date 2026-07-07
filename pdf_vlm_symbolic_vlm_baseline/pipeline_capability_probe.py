@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any
 
 from .config import load_pipeline_config, model_slug
-from .data_io import append_jsonl, find_official_file, read_jsonl
+from .data_io import append_jsonl, extract_answer_contract, find_official_file, read_jsonl
 from .metadata_index import build_metadata_records, retrieve_candidates
 from .parser import extract_json_object
 from .pdf_cache import ensure_candidate_pdfs
@@ -134,7 +134,15 @@ def main() -> int:
     rows.append({"step": "answer VLM 支持 image input", "ok": answer_client.supports_image_input(), "detail": config.answer_model})
     if parser_records and answer_probe.get("can_generate"):
         selected = select_symbolic_contexts(str(sample.get("question", "")), parser_records, args.processed_output_dir, model_slug(config.parser_model), query_id=str(sample.get("query_id")))
-        prompt = build_symbolic_answer_prompt(sample, candidates, selected, answer_client.supports_image_input(), config.parser_model, config.answer_model)
+        prompt = build_symbolic_answer_prompt(
+            sample,
+            candidates,
+            selected,
+            answer_client.supports_image_input(),
+            config.parser_model,
+            config.answer_model,
+            extract_answer_contract(sample),
+        )
         rows.append({"step": "完成一次 mini flow", "ok": bool(prompt and selected.get("selected_records")), "detail": f"selected_records={len(selected.get('selected_records', []))}"})
     else:
         rows.append({"step": "完成一次 mini flow", "ok": False, "detail": "parser 或 answer probe 不可用，未伪造 mini flow"})
