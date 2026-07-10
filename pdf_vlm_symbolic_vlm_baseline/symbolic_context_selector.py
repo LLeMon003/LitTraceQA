@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections import Counter
 from pathlib import Path
+import re
 from typing import Any
 
 from .metadata_index import BM25Okapi, tokenize
@@ -14,6 +15,14 @@ from .symbolic_schema import (
 )
 
 
+SOURCE_TYPE_ORDER = {
+    "table": 0,
+    "figure": 1,
+    "equation_algorithm": 2,
+    "text_span": 3,
+    "citation_context": 4,
+}
+
 TYPE_BOOSTS = {
     "table": {"table": 2.0},
     "figure": {"figure": 2.0},
@@ -21,6 +30,123 @@ TYPE_BOOSTS = {
     "citation_context": {"citation_context": 2.0},
     "text_span": {"paragraph": 1.2},
 }
+
+TABLE_ID_RE = re.compile(r"\btable\s+([A-Za-z0-9.\-]+)", re.IGNORECASE)
+FIGURE_ID_RE = re.compile(r"\b(?:figure|fig\.)\s+([A-Za-z0-9.\-]+)", re.IGNORECASE)
+ALGORITHM_ID_RE = re.compile(r"\balgorithm\s+([A-Za-z0-9.\-]+)", re.IGNORECASE)
+
+
+def _normalized_object_id(prefix: str, value: Any) -> str:
+    text = str(value or "").strip().rstrip(".,;:")
+    if not text:
+        return ""
+    if text.lower().startswith(prefix.lower()):
+        return text
+    return f"{prefix} {text}"
+
+
+def _question_targets(query: str) -> dict[str, Any]:
+    lower = str(query or "").lower()
+    table_match = TABLE_ID_RE.search(query or "")
+    figure_match = FIGURE_ID_RE.search(query or "")
+    algorithm_match = ALGORITHM_ID_RE.search(query or "")
+    equation_match = re.search(r"\b(?:equation|eq\.)\s*\(?([A-Za-z0-9.\-]+)\)?", query or "", re.IGNORECASE)
+    reference_id: int | None = None
+    for pattern in (
+        r"\b(?:reference|ref\.)\s*\[?(\d{1,3})\]?",
+        r"\b(\d{1,3})(?:st|nd|rd|th)\s+reference\b",
+    ):
+        match = re.search(pattern, lower)
+        if match:
+            try:
+                reference_id = int(match.group(1))
+                break
+            except ValueError:
+                pass
+    return {
+        "table_id": _normalized_object_id("Table", table_match.group(1) if table_match else ""),
+        "figure_id": _normalized_object_id("Figure", figure_match.group(1) if figure_match else ""),
+        "algorithm_id": _normalized_object_id("Algorithm", algorithm_match.group(1) if algorithm_match else ""),
+        "equation_id": str(equation_match.group(1)).strip().rstrip(".,;:") if equation_match else "",
+        "reference_id": reference_id,
+        "last_reference": bool(re.search(r"\blast\s+reference\b|\bindex\s+of\s+the\s+last\s+reference\b", lower)),
+        "subfigure_count": bool(re.search(r"\bhow many\s+(?:subfigures|sub-figures|panels)\b|\bnumber of\s+(?:subfigures|sub-figures|panels)\b", lower)),
+        "hardware": bool(re.search(r"\bhardware\b|\bgpu\b|\bconfigure\b|\bconfiguration\b", lower)),
+    }
+
+
+def _object_mention(prefix: str, value: str) -> re.Pattern[str] | None:
+    if not value:
+        return None
+    suffix = re.sub(rf"^{re.escape(prefix)}\s*", "", value, flags=re.IGNORECASE).strip()
+    if not suffix:
+        return None
+    return re.compile(rf"\b{re.escape(prefix)}\s*{re.escape(suffix)}\b", re.IGNORECASE)
+
+
+def _record_source_type_bonus(
+    *,
+    source_type: str,
+    primary_evidence_type: str | None,
+    query: str,
+    text: str,
+    label: Any,
+    targets: dict[str, Any],
+) -> float:
+    """Small record-level target bonus.
+
+    Page ranking uses large bonuses to decide which pages are worth parsing.
+    Here the page has already been selected, so bonuses are intentionally small:
+    they should help truncation prefer likely evidence without eliminating
+    diverse support records needed for VLM-2 global reasoning.
+    """
+
+    bonus = 0.0
+    combined = " ".join([str(label or ""), text or ""])
+    primary = to_official_source_type(source_type=primary_evidence_type) or str(primary_evidence_type or "")
+    if source_type == primary:
+        bonus += 0.35
+    if source_type == "table":
+        table_pattern = _object_mention("Table", str(targets.get("table_id") or ""))
+        if table_pattern and table_pattern.search(combined):
+            bonus += 3.0
+        elif re.search(r"\btable\b", combined, re.IGNORECASE):
+            bonus += 0.45
+        if re.search(r"\|.+\|", text or ""):
+            bonus += 0.35
+    elif source_type == "figure":
+        figure_pattern = _object_mention("Figure", str(targets.get("figure_id") or ""))
+        if figure_pattern and figure_pattern.search(combined):
+            bonus += 3.0
+        elif re.search(r"\b(?:figure|fig\.)\b", combined, re.IGNORECASE):
+            bonus += 0.45
+        if targets.get("subfigure_count") and re.search(r"\([a-z]\)", text or ""):
+            bonus += 0.7
+    elif source_type == "citation_context":
+        target_ref = targets.get("reference_id")
+        if isinstance(target_ref, int) and re.search(rf"(?:^|\n|\s)\[{target_ref}\]\s+", text or ""):
+            bonus += 3.0
+        if targets.get("last_reference") and re.search(r"(?:^|\n|\s)\[\d{1,3}\]\s+", text or ""):
+            bonus += 1.1
+        if re.search(r"\breferences\b", text or "", re.IGNORECASE):
+            bonus += 0.8
+    elif source_type == "equation_algorithm":
+        algorithm_pattern = _object_mention("Algorithm", str(targets.get("algorithm_id") or ""))
+        equation_id = str(targets.get("equation_id") or "")
+        if algorithm_pattern and algorithm_pattern.search(combined):
+            bonus += 3.0
+        if equation_id and re.search(rf"\(\s*{re.escape(equation_id)}\s*\)", combined):
+            bonus += 3.0
+        elif re.search(r"\b(?:algorithm|equation|loss|objective)\b|=", combined, re.IGNORECASE):
+            bonus += 0.6
+    elif source_type == "text_span":
+        if targets.get("hardware") and re.search(r"\b(?:gpu|rtx|a100|h100|cuda|nvidia)\b", text or "", re.IGNORECASE):
+            bonus += 2.0
+        if re.search(r"\b(?:implementation|experiment|setup|configuration|hardware|optimizer|learning rate|batch size|epoch|overhead|efficiency)\b", text or "", re.IGNORECASE):
+            bonus += 0.45
+    if re.search(r"\b(?:answer|result|performance|score|accuracy|f1|nrmse|ap|success rate)\b", query, re.IGNORECASE) and re.search(r"[-+]?\d+(?:\.\d+)?%?", text or ""):
+        bonus += 0.25
+    return bonus
 
 
 def _image_path_for(record: dict[str, Any], processed_root: Path, parser_model_slug: str) -> str:
@@ -109,6 +235,56 @@ def _select_with_type_budgets(
     return selected[:total_budget]
 
 
+def _record_order_key(record: dict[str, Any]) -> tuple[Any, ...]:
+    try:
+        page = int(record.get("page") or 0)
+    except (TypeError, ValueError):
+        page = 0
+    return (
+        -float(record.get("_candidate_bm25_score") or 0.0),
+        str(record.get("paper_id") or ""),
+        page,
+        SOURCE_TYPE_ORDER.get(str(record.get("source_type") or ""), 99),
+        str(record.get("record_id") or ""),
+    )
+
+
+def _limit_records(records: list[dict[str, Any]], max_records: int = 0, max_chars: int = 0) -> tuple[list[dict[str, Any]], bool]:
+    limited = records
+    truncated = False
+    if max_records and max_records > 0 and len(limited) > max_records:
+        limited = limited[:max_records]
+        truncated = True
+    if max_chars and max_chars > 0:
+        char_total = 0
+        char_limited: list[dict[str, Any]] = []
+        for record in limited:
+            text_len = len(str(record.get("text") or ""))
+            if char_limited and char_total + text_len > max_chars:
+                truncated = True
+                break
+            char_limited.append(record)
+            char_total += text_len
+        limited = char_limited
+    return limited, truncated
+
+
+def _dedupe_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for record in records:
+        key = _record_key(record)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(record)
+    return deduped
+
+
+def _has_context_limit(max_records: int = 0, max_chars: int = 0) -> bool:
+    return (max_records is not None and max_records > 0) or (max_chars is not None and max_chars > 0)
+
+
 def select_symbolic_contexts(
     query: str,
     candidate_records: list[dict[str, Any]],
@@ -125,6 +301,9 @@ def select_symbolic_contexts(
     support_text_min: int = 4,
     context_types_enabled: bool = True,
     context_type_budget_per_type: int = 3,
+    context_selection_mode: str = "page_all_symbolic",
+    max_context_records: int = 0,
+    max_context_chars: int = 0,
 ) -> dict[str, Any]:
     allow_header_footer = _query_needs_header_footer(query)
     valid = [
@@ -136,7 +315,7 @@ def select_symbolic_contexts(
     if not valid:
         return {
             "query_id": query_id,
-            "selection_method": "symbolic_lexical_bm25_without_embedding",
+            "selection_method": f"symbolic_{context_selection_mode}",
             "partial_artifacts_present": False,
             "partial_selected_record_count": 0,
             "prompt_context_mode": vlm2_context_mode,
@@ -148,21 +327,35 @@ def select_symbolic_contexts(
             "primary_evidence_type_count": 0,
             "supporting_evidence_count": 0,
             "grounding_label_hints_by_type": {},
+            "context_selection_mode": str(context_selection_mode or "page_all_symbolic").strip().lower(),
+            "context_truncated": False,
+            "selected_record_count": 0,
         }
     query_tokens = tokenize(query)
     corpus = [tokenize(" ".join([str(r.get("text") or ""), str(r.get("label") or "")])) for r in valid]
     bm25 = BM25Okapi(corpus)
     scores = bm25.get_scores(query_tokens) if query_tokens else [0.0] * len(valid)
     boosts = TYPE_BOOSTS.get(primary_evidence_type or "", {})
+    targets = _question_targets(query)
     processed = Path(processed_root)
     ranked: list[dict[str, Any]] = []
     for record, bm25_score in zip(valid, scores):
         source_type = to_official_source_type(record.get("record_type"), record.get("source_type"))
         if source_type not in OFFICIAL_EVIDENCE_SOURCE_TYPES:
             continue
+        text = str(record.get("text") or "")
+        source_bonus = _record_source_type_bonus(
+            source_type=source_type,
+            primary_evidence_type=primary_evidence_type,
+            query=query,
+            text=text,
+            label=record.get("label"),
+            targets=targets,
+        )
         score = float(bm25_score)
         score += boosts.get(str(record.get("record_type")), 0.0)
         score += boosts.get(source_type, 0.0)
+        score += source_bonus
         score += 0.15 * float(record.get("_candidate_bm25_score") or 0.0)
         record_type = str(record.get("record_type") or "")
         if str(record.get("_page_status") or record.get("page_status") or "") == "partial":
@@ -183,6 +376,7 @@ def select_symbolic_contexts(
             "label": record.get("label"),
             "grounding_label": grounding_label_from_record(source_type, record.get("label")),
             "score": round(score, 6),
+            "source_type_specific_bonus": round(source_bonus, 6),
             "text": record.get("text"),
             "locator": record.get("locator") or {"page": record.get("page")},
             "image_path": _image_path_for(record, processed, parser_model_slug),
@@ -191,17 +385,29 @@ def select_symbolic_contexts(
         selected["_page_status"] = record.get("_page_status") or record.get("page_status")
         ranked.append(selected)
     ranked.sort(key=lambda item: item["score"], reverse=True)
-    selected_records_internal = _select_with_type_budgets(
-        ranked,
-        evidence_total_budget or top_n_records,
-        primary_evidence_type,
-        primary_evidence_min,
-        support_text_min,
-        context_types_enabled,
-        context_type_budget_per_type,
-    )
+    normalized_mode = str(context_selection_mode or "page_all_symbolic").strip().lower()
+    if normalized_mode in {"ranked_budget", "bm25_budget", "record_budget"}:
+        selected_records_internal = _select_with_type_budgets(
+            ranked,
+            evidence_total_budget or top_n_records,
+            primary_evidence_type,
+            primary_evidence_min,
+            support_text_min,
+            context_types_enabled,
+            context_type_budget_per_type,
+        )
+        selection_method = "symbolic_lexical_bm25_type_budget"
+        context_truncated = False
+    else:
+        limit_enabled = _has_context_limit(max_context_records, max_context_chars)
+        selected_records_internal = _dedupe_records(list(ranked)) if limit_enabled else _dedupe_records(sorted(ranked, key=_record_order_key))
+        selected_records_internal, context_truncated = _limit_records(
+            selected_records_internal,
+            max_context_records,
+            max_context_chars,
+        )
+        selection_method = "symbolic_page_all_records_relevance_limited" if limit_enabled else "symbolic_page_all_records_from_routed_pages"
     partial_count = sum(1 for r in selected_records_internal if r.get("_page_status") == "partial")
-    selection_method = "symbolic_lexical_bm25_without_embedding"
     selected_records_debug = []
     for rank, record in enumerate(selected_records_internal, start=1):
         debug_record = {k: v for k, v in record.items() if not k.startswith("_")}
@@ -248,4 +454,7 @@ def select_symbolic_contexts(
         "primary_evidence_type_count": primary_count,
         "supporting_evidence_count": max(0, len(selected_evidence) - primary_count),
         "grounding_label_hints_by_type": grounding_label_hints_by_type,
+        "context_selection_mode": normalized_mode,
+        "context_truncated": context_truncated,
+        "selected_record_count": len(selected_evidence),
     }

@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import io
 import json
+import socket
 import time
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -12,6 +14,14 @@ from PIL import Image
 
 from .config import PipelineConfig, is_api_key_configured
 from .vlm_parser_client import _model_looks_vision_capable
+
+
+class AnswerVLMError(RuntimeError):
+    def __init__(self, message: str, *, kind: str = "unknown", status_code: int | None = None, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.status_code = status_code
+        self.retryable = retryable
 
 
 class VLMAnswerClient:
@@ -67,6 +77,8 @@ class VLMAnswerClient:
         body = json.dumps(payload).encode("utf-8")
         headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.config.answer_api_key}"}
         last_error: Exception | None = None
+        rate_limit_retries = 0
+        rate_limit_backoff = max(0.0, self.config.generation_429_initial_backoff_seconds)
         for attempt in range(self.retries + 1):
             try:
                 request = urllib.request.Request(url, data=body, headers=headers, method="POST")
@@ -75,11 +87,35 @@ class VLMAnswerClient:
                 data = json.loads(raw)
                 content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
                 return {"raw_response": data, "content": content}
+            except urllib.error.HTTPError as exc:
+                last_error = exc
+                if exc.code == 429 and self.config.generation_retry_on_429 and rate_limit_retries < self.config.generation_429_max_retries:
+                    sleep_seconds = min(rate_limit_backoff, self.config.generation_429_max_backoff_seconds)
+                    if self.config.generation_cooldown_after_429_seconds > 0:
+                        sleep_seconds = max(sleep_seconds, self.config.generation_cooldown_after_429_seconds)
+                    time.sleep(max(0.0, sleep_seconds))
+                    rate_limit_retries += 1
+                    rate_limit_backoff *= max(1.0, self.config.generation_429_backoff_multiplier)
+                    continue
+                if exc.code in {500, 502, 503, 504} and attempt < self.retries:
+                    time.sleep(2**attempt)
+                    continue
+                kind = "rate_limit" if exc.code == 429 else "context_length" if exc.code in {400, 413} else "http"
+                retryable = exc.code in {429, 500, 502, 503, 504}
+                raise AnswerVLMError(f"Answer VLM call failed: HTTP Error {exc.code}: {exc.reason}", kind=kind, status_code=exc.code, retryable=retryable) from exc
+            except (TimeoutError, socket.timeout) as exc:
+                last_error = exc
+                if attempt < self.retries:
+                    time.sleep(2**attempt)
+                    continue
+                raise AnswerVLMError(f"Answer VLM call failed: timeout: {exc}", kind="timeout", retryable=True) from exc
             except Exception as exc:
                 last_error = exc
                 if attempt < self.retries:
                     time.sleep(2**attempt)
-        raise RuntimeError(f"Answer VLM call failed: {last_error}") from last_error
+                    continue
+                raise AnswerVLMError(f"Answer VLM call failed: {last_error}", kind="unknown", retryable=False) from last_error
+        raise AnswerVLMError(f"Answer VLM call failed: {last_error}", kind="unknown", retryable=False) from last_error
 
 
 def probe_text_json(model: str, api_key: str | None, base_url: str, timeout_seconds: float = 30) -> dict[str, Any]:

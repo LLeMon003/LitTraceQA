@@ -20,6 +20,41 @@ FIGURE_RE = re.compile(r"\b(?:Figure|Fig\.)\s+[A-Za-z]*\d+[A-Za-z0-9.\-]*", re.I
 EQUATION_RE = re.compile(r"\b(?:Equation|Eq\.|Algorithm|Theorem|loss|objective|argmax|sum|minimize)\b|[=∑∏∫≤≥]", re.IGNORECASE)
 CITATION_RE = re.compile(r"\[[0-9,\-\s]+\]|\([A-Z][A-Za-z\-]+(?: et al\.)?,\s*20[0-9]{2}\)|\bReferences\b|\bRelated Work\b", re.IGNORECASE)
 SECTION_RE = re.compile(r"^\s*(?:[0-9]+\.?\s+)?(?:Abstract|Introduction|Method|Approach|Experiment|Results|Ablation|Analysis|Conclusion|References)\b", re.IGNORECASE | re.MULTILINE)
+QUERY_ALIAS_RE = re.compile(r"\b(?:[A-Z]{2,}[A-Za-z0-9.\-]*|[A-Za-z]+(?:-[A-Za-z0-9]+)+|[A-Za-z]*\d+[A-Za-z0-9.\-]*|[A-Za-z]+[A-Z][A-Za-z0-9.\-]*)\b")
+
+BENCHMARK_TERMS = [
+    "CIFAR-10",
+    "CIFAR-100",
+    "ImageNet",
+    "ImageNet-64",
+    "ImageNet-256",
+    "Tiny ImageNet",
+    "ModelNet40",
+    "GenEval",
+    "Omni3D",
+    "SUN RGB-D",
+    "ARKitScenes",
+    "Hypersim",
+    "Objectron",
+    "KITTI",
+    "nuScenes",
+    "NaturalQ",
+]
+
+METRIC_TERMS = [
+    "FID",
+    "F1",
+    "AP",
+    "OA",
+    "accuracy",
+    "score",
+    "NFE",
+    "NRMSE",
+    "learning rate",
+    "optimizer",
+    "batch size",
+    "base model",
+]
 
 ORDINAL_WORDS = {
     "first": 1,
@@ -122,6 +157,59 @@ def _question_targets(sample: dict[str, Any]) -> dict[str, Any]:
         "hardware": bool(re.search(r"\bhardware\b|\bgpu\b|\bconfigure\b|\bconfiguration\b", lower)),
         "subfigure_count": bool(re.search(r"\bhow many\s+(?:subfigures|sub-figures|panels)\b|\bnumber of\s+(?:subfigures|sub-figures|panels)\b", lower)),
     }
+
+
+def _normalized_hint_text(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _query_hint_terms(sample: dict[str, Any]) -> dict[str, list[str]]:
+    question = str(sample.get("question") or "")
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for match in QUERY_ALIAS_RE.finditer(question):
+        term = match.group(0).strip(".,;:()[]{}")
+        if len(term) < 2:
+            continue
+        key = _normalized_hint_text(term)
+        if key and key not in seen:
+            seen.add(key)
+            aliases.append(term)
+
+    benchmarks = [term for term in BENCHMARK_TERMS if re.search(re.escape(term), question, re.IGNORECASE)]
+    metrics = [term for term in METRIC_TERMS if re.search(rf"\b{re.escape(term)}\b", question, re.IGNORECASE)]
+    return {"aliases": aliases, "benchmarks": benchmarks, "metrics": metrics}
+
+
+def _query_hint_bonus(sample: dict[str, Any], text: str) -> float:
+    if not text:
+        return 0.0
+    hints = _query_hint_terms(sample)
+    text_lower = text.lower()
+    text_norm = _normalized_hint_text(text)
+    bonus = 0.0
+
+    alias_hits = 0
+    for alias in hints["aliases"]:
+        alias_norm = _normalized_hint_text(alias)
+        if not alias_norm:
+            continue
+        if alias.lower() in text_lower or alias_norm in text_norm:
+            alias_hits += 1
+    bonus += min(12.0, alias_hits * 3.0)
+
+    benchmark_hits = 0
+    for term in hints["benchmarks"]:
+        if term.lower() in text_lower or _normalized_hint_text(term) in text_norm:
+            benchmark_hits += 1
+    bonus += min(10.0, benchmark_hits * 4.0)
+
+    metric_hits = 0
+    for term in hints["metrics"]:
+        if term.lower() in text_lower or _normalized_hint_text(term) in text_norm:
+            metric_hits += 1
+    bonus += min(6.0, metric_hits * 1.5)
+    return bonus
 
 
 def _reference_numbers(text: str) -> list[int]:
@@ -261,6 +349,273 @@ def build_global_page_pool(candidates: list[dict[str, Any]], paper_page_texts: d
     return pool
 
 
+def _task_family_bucket(sample: dict[str, Any]) -> str:
+    task_family = str(sample.get("task_family") or "").strip().lower().replace("-", "_")
+    return "multi_paper" if "multi" in task_family else "single_paper"
+
+
+def _page_routing_strategy(
+    sample: dict[str, Any],
+    task_family_strategy_enabled: bool,
+    single_strategy: str,
+    multi_strategy: str,
+) -> str:
+    if not task_family_strategy_enabled:
+        return "global_ranked_pages"
+    strategy = multi_strategy if _task_family_bucket(sample) == "multi_paper" else single_strategy
+    if strategy not in {"global_ranked_pages", "top1_candidate_first", "top1_candidate_quota", "multi_candidate_primary_then_global", "per_candidate_primary_then_global"}:
+        return "global_ranked_pages"
+    return strategy
+
+
+def _page_selection_row(row: dict[str, Any], *, selected_by_top1_quota: bool = False, selection_rank: int | None = None) -> dict[str, Any]:
+    result = {
+        "paper_id": row["paper_id"],
+        "page": row["page"],
+        "global_page_rank": row["global_page_rank"],
+        "candidate_rank": row["candidate_rank"],
+        "page_selection_strategy": row.get("page_selection_strategy", "global_ranked_pages"),
+        "selected_by_top1_quota": bool(selected_by_top1_quota),
+    }
+    if selection_rank is not None:
+        result["selection_rank"] = selection_rank
+    return result
+
+
+def _selected_key(row: dict[str, Any]) -> tuple[str, int]:
+    return (str(row.get("paper_id") or ""), int(row.get("page") or 0))
+
+
+def _select_global_ranked_pages(ranked_pages: list[dict[str, Any]], initial_limit: int, strategy: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    selected = []
+    for rank, row in enumerate(ranked_pages[:initial_limit], start=1):
+        row["selected_for_initial_parse"] = True
+        row["page_selection_strategy"] = strategy
+        selected.append(_page_selection_row(row, selection_rank=rank))
+    return selected, {
+        "top1_pages_in_global_top_p_before_quota": 0,
+        "top1_pages_selected_after_quota": 0,
+        "top1_min_pages_required": 0,
+        "top1_quota_added_pages": 0,
+        "top1_quota_replaced_pages": 0,
+        "top1_quota_satisfied_without_change": False,
+        "top1_quota_replaced": [],
+    }
+
+
+def _select_top1_candidate_first(
+    ranked_pages: list[dict[str, Any]],
+    initial_limit: int,
+    top1_candidate_paper_id: str,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    ordered = [
+        row
+        for row in ranked_pages
+        if str(row.get("paper_id") or "") == top1_candidate_paper_id
+    ] + [
+        row
+        for row in ranked_pages
+        if str(row.get("paper_id") or "") != top1_candidate_paper_id
+    ]
+    selected_raw = ordered[:initial_limit]
+    selected = []
+    for rank, row in enumerate(selected_raw, start=1):
+        row["selected_for_initial_parse"] = True
+        row["page_selection_strategy"] = "top1_candidate_first"
+        selected.append(_page_selection_row(row, selection_rank=rank))
+    top1_count = sum(1 for row in selected_raw if str(row.get("paper_id") or "") == top1_candidate_paper_id)
+    return selected, {
+        "top1_pages_in_global_top_p_before_quota": sum(
+            1 for row in ranked_pages[:initial_limit] if str(row.get("paper_id") or "") == top1_candidate_paper_id
+        ),
+        "top1_pages_selected_after_quota": top1_count,
+        "top1_min_pages_required": 0,
+        "top1_quota_added_pages": 0,
+        "top1_quota_replaced_pages": 0,
+        "top1_quota_satisfied_without_change": False,
+        "top1_quota_replaced": [],
+    }
+
+
+def _select_top1_candidate_quota(
+    ranked_pages: list[dict[str, Any]],
+    initial_limit: int,
+    top1_candidate_paper_id: str,
+    single_top1_min_pages: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    selected = list(ranked_pages[:initial_limit])
+    selected_keys = {_selected_key(row) for row in selected}
+    before_top1_count = sum(1 for row in selected if str(row.get("paper_id") or "") == top1_candidate_paper_id)
+    available_top1_count = sum(1 for row in ranked_pages if str(row.get("paper_id") or "") == top1_candidate_paper_id)
+    required = int(single_top1_min_pages or 0)
+    if required <= 0:
+        required = math.ceil(max(0, initial_limit) / 3)
+    required = min(max(0, required), initial_limit, available_top1_count)
+
+    replaced: list[dict[str, Any]] = []
+    added_count = 0
+    if before_top1_count < required:
+        top1_extras = [
+            row
+            for row in ranked_pages
+            if str(row.get("paper_id") or "") == top1_candidate_paper_id and _selected_key(row) not in selected_keys
+        ]
+        for extra in top1_extras:
+            if sum(1 for row in selected if str(row.get("paper_id") or "") == top1_candidate_paper_id) >= required:
+                break
+            non_top1 = [
+                (idx, row)
+                for idx, row in enumerate(selected)
+                if str(row.get("paper_id") or "") != top1_candidate_paper_id
+            ]
+            if not non_top1:
+                break
+            remove_idx, removed = max(non_top1, key=lambda item: int(item[1].get("global_page_rank") or 0))
+            selected_keys.discard(_selected_key(removed))
+            selected[remove_idx] = extra
+            selected_keys.add(_selected_key(extra))
+            extra["selected_by_top1_quota"] = True
+            replaced.append(
+                {
+                    "removed": _page_selection_row(removed),
+                    "added": _page_selection_row(extra, selected_by_top1_quota=True),
+                }
+            )
+            added_count += 1
+
+    selected.sort(key=lambda row: int(row.get("global_page_rank") or 999999))
+    selected_rows = []
+    for rank, row in enumerate(selected, start=1):
+        row["selected_for_initial_parse"] = True
+        row["page_selection_strategy"] = "top1_candidate_quota"
+        selected_rows.append(
+            _page_selection_row(
+                row,
+                selected_by_top1_quota=bool(row.get("selected_by_top1_quota")),
+                selection_rank=rank,
+            )
+        )
+    after_top1_count = sum(1 for row in selected if str(row.get("paper_id") or "") == top1_candidate_paper_id)
+    return selected_rows, {
+        "top1_pages_in_global_top_p_before_quota": before_top1_count,
+        "top1_pages_selected_after_quota": after_top1_count,
+        "top1_min_pages_required": required,
+        "top1_quota_added_pages": added_count,
+        "top1_quota_replaced_pages": len(replaced),
+        "top1_quota_satisfied_without_change": before_top1_count >= required,
+        "top1_quota_replaced": replaced,
+    }
+
+
+def _row_primary_score(row: dict[str, Any]) -> float:
+    components = row.get("score_components") if isinstance(row.get("score_components"), dict) else {}
+    return float(components.get("primary_evidence_type_boost") or 0.0) + float(components.get("target_locator_bonus") or 0.0) + float(components.get("label_match_boost") or 0.0)
+
+
+def _select_multi_candidate_primary_then_global(
+    ranked_pages: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    initial_limit: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    selected: list[dict[str, Any]] = []
+    selected_keys: set[tuple[str, int]] = set()
+    candidate_ids = [str(candidate.get("paper_id") or "") for candidate in candidates if str(candidate.get("paper_id") or "")]
+    per_candidate_added: list[dict[str, Any]] = []
+
+    for paper_id in candidate_ids:
+        if len(selected) >= initial_limit:
+            break
+        paper_pages = [row for row in ranked_pages if str(row.get("paper_id") or "") == paper_id]
+        if not paper_pages:
+            continue
+        best = max(
+            paper_pages,
+            key=lambda row: (
+                _row_primary_score(row),
+                float(row.get("score") or 0.0),
+                -int(row.get("global_page_rank") or 999999),
+            ),
+        )
+        key = _selected_key(best)
+        if key in selected_keys:
+            continue
+        best["selected_by_multi_candidate_primary_quota"] = True
+        selected.append(best)
+        selected_keys.add(key)
+        per_candidate_added.append(_page_selection_row(best, selection_rank=len(selected)))
+
+    for row in ranked_pages:
+        if len(selected) >= initial_limit:
+            break
+        key = _selected_key(row)
+        if key in selected_keys:
+            continue
+        selected.append(row)
+        selected_keys.add(key)
+
+    selected.sort(key=lambda row: int(row.get("global_page_rank") or 999999))
+    selected_rows = []
+    for rank, row in enumerate(selected, start=1):
+        row["selected_for_initial_parse"] = True
+        row["page_selection_strategy"] = "multi_candidate_primary_then_global"
+        selected_rows.append(
+            _page_selection_row(
+                row,
+                selected_by_top1_quota=bool(row.get("selected_by_multi_candidate_primary_quota")),
+                selection_rank=rank,
+            )
+        )
+    covered_candidates = {str(row.get("paper_id") or "") for row in selected}
+    return selected_rows, {
+        "top1_pages_in_global_top_p_before_quota": 0,
+        "top1_pages_selected_after_quota": 0,
+        "top1_min_pages_required": 0,
+        "top1_quota_added_pages": 0,
+        "top1_quota_replaced_pages": 0,
+        "top1_quota_satisfied_without_change": False,
+        "top1_quota_replaced": [],
+        "multi_candidate_primary_quota_enabled": True,
+        "multi_candidate_primary_quota_candidate_count": len(candidate_ids),
+        "multi_candidate_primary_quota_covered_count": len(covered_candidates),
+        "multi_candidate_primary_quota_added_pages": len(per_candidate_added),
+        "multi_candidate_primary_quota_added": per_candidate_added,
+    }
+
+
+def _select_initial_pages(
+    ranked_pages: list[dict[str, Any]],
+    candidates: list[dict[str, Any]],
+    sample: dict[str, Any],
+    initial_limit: int,
+    *,
+    task_family_strategy_enabled: bool,
+    single_strategy: str,
+    multi_strategy: str,
+    single_top1_min_pages: int,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    top1_candidate_paper_id = str(candidates[0].get("paper_id") or "") if candidates else ""
+    strategy = _page_routing_strategy(sample, task_family_strategy_enabled, single_strategy, multi_strategy)
+    for row in ranked_pages:
+        row["selected_for_initial_parse"] = False
+        row["page_selection_strategy"] = strategy
+        row["selected_by_top1_quota"] = False
+    if strategy == "top1_candidate_first" and top1_candidate_paper_id:
+        selected, quota = _select_top1_candidate_first(ranked_pages, initial_limit, top1_candidate_paper_id)
+    elif strategy == "top1_candidate_quota" and top1_candidate_paper_id:
+        selected, quota = _select_top1_candidate_quota(ranked_pages, initial_limit, top1_candidate_paper_id, single_top1_min_pages)
+    elif strategy in {"multi_candidate_primary_then_global", "per_candidate_primary_then_global"}:
+        selected, quota = _select_multi_candidate_primary_then_global(ranked_pages, candidates, initial_limit)
+    else:
+        selected, quota = _select_global_ranked_pages(ranked_pages, initial_limit, strategy)
+    quota.update(
+        {
+            "page_routing_strategy": strategy,
+            "top1_candidate_paper_id": top1_candidate_paper_id,
+        }
+    )
+    return selected, quota
+
+
 def rank_global_pages_for_query(
     query_example: dict[str, Any],
     candidates: list[dict[str, Any]],
@@ -270,16 +625,27 @@ def rank_global_pages_for_query(
     *,
     fallback_on_empty_text: bool = True,
     empty_text_parse_first_n_pages: int = 4,
+    page_ranking_bonus_enabled: bool = True,
+    task_family_strategy_enabled: bool = False,
+    single_strategy: str = "global_ranked_pages",
+    multi_strategy: str = "global_ranked_pages",
+    single_top1_min_pages: int = 0,
 ) -> dict[str, Any]:
     query_id = str(query_example.get("query_id") or "")
     primary_type = _effective_source_type(query_example)
     query = _query_text(query_example)
     pool = build_global_page_pool(candidates, paper_page_texts, query_id)
+    strategy = _page_routing_strategy(query_example, task_family_strategy_enabled, single_strategy, multi_strategy)
+    top1_candidate_paper_id = str(candidates[0].get("paper_id") or "") if candidates else ""
     if not pool:
         return {
             "query_id": query_id,
             "ranking_source": "native_text",
             "ranking_method": "global_native_text_bm25_rules",
+            "page_ranking_bonus_enabled": page_ranking_bonus_enabled,
+            "page_routing_task_family_strategy_enabled": task_family_strategy_enabled,
+            "page_routing_strategy": strategy,
+            "top1_candidate_paper_id": top1_candidate_paper_id,
             "total_candidate_pages": 0,
             "ranked_pages": [],
             "selected_pages_initial": [],
@@ -311,22 +677,27 @@ def rank_global_pages_for_query(
                     },
                     "native_text_char_count": row["native_text_char_count"],
                     "selected_for_initial_parse": selected,
+                    "page_selection_strategy": strategy,
+                    "selected_by_top1_quota": False,
                 }
             )
-        selected_initial = [
-            {
-                "paper_id": row["paper_id"],
-                "page": row["page"],
-                "global_page_rank": row["global_page_rank"],
-                "candidate_rank": row["candidate_rank"],
-            }
-            for row in ranked_pages
-            if row["selected_for_initial_parse"]
-        ]
+        selected_initial, quota_info = _select_initial_pages(
+            ranked_pages,
+            candidates,
+            query_example,
+            min(empty_limit, len(ranked_pages)),
+            task_family_strategy_enabled=task_family_strategy_enabled,
+            single_strategy=single_strategy,
+            multi_strategy=multi_strategy,
+            single_top1_min_pages=single_top1_min_pages,
+        )
         return {
             "query_id": query_id,
             "ranking_source": "native_text",
             "ranking_method": "global_native_text_bm25_rules",
+            "page_ranking_bonus_enabled": page_ranking_bonus_enabled,
+            "page_routing_task_family_strategy_enabled": task_family_strategy_enabled,
+            **quota_info,
             "top_k_papers": len(candidates),
             "total_candidate_pages": len(pool),
             "ranked_pages": ranked_pages,
@@ -345,15 +716,25 @@ def rank_global_pages_for_query(
         text = str(row.get("native_text") or "")
         tokens = set(tokenize(text))
         overlap = len(query_token_set & tokens) / max(1.0, math.sqrt(len(query_token_set) + 1))
-        rule = _rule_boosts(text, primary_type)
+        rule = _rule_boosts(text, primary_type) if page_ranking_bonus_enabled else {
+            "primary_evidence_type_boost": 0.0,
+            "label_match_boost": 0.0,
+            "section_heading_boost": 0.0,
+            "page_position_prior": 0.0,
+        }
         prior = _candidate_score_prior(row)
         position = _page_position_prior(int(row.get("page") or 0), page_count_by_paper[str(row.get("paper_id"))], primary_type)
-        evidence_bonus = _evidence_page_bonus(
-            query_example,
-            text,
-            page_number=int(row.get("page") or 0),
-            total_pages=page_count_by_paper[str(row.get("paper_id"))],
+        evidence_bonus = (
+            _evidence_page_bonus(
+                query_example,
+                text,
+                page_number=int(row.get("page") or 0),
+                total_pages=page_count_by_paper[str(row.get("paper_id"))],
+            )
+            if page_ranking_bonus_enabled
+            else 0.0
         )
+        query_hint = _query_hint_bonus(query_example, text) if page_ranking_bonus_enabled else 0.0
         components = {
             "native_text_bm25": float(bm25_score),
             "query_overlap": float(overlap),
@@ -363,6 +744,7 @@ def rank_global_pages_for_query(
             "section_heading_boost": rule["section_heading_boost"],
             "page_position_prior": position,
             "target_locator_bonus": evidence_bonus,
+            "query_hint_bonus": query_hint,
         }
         score = sum(float(value) for value in components.values())
         scored.append((score, {**row, "score": score, "score_components": components}))
@@ -380,32 +762,51 @@ def rank_global_pages_for_query(
                 "score_components": row["score_components"],
                 "native_text_char_count": row["native_text_char_count"],
                 "has_native_text": row["has_native_text"],
-                "selected_for_initial_parse": rank <= initial_limit,
+                "selected_for_initial_parse": False,
+                "page_selection_strategy": strategy,
+                "selected_by_top1_quota": False,
             }
         )
-    selected_initial = [
-        {
-            "paper_id": row["paper_id"],
-            "page": row["page"],
-            "global_page_rank": row["global_page_rank"],
-            "candidate_rank": row["candidate_rank"],
-        }
-        for row in ranked_pages[:initial_limit]
+    selected_initial, quota_info = _select_initial_pages(
+        ranked_pages,
+        candidates,
+        query_example,
+        min(initial_limit, len(ranked_pages)),
+        task_family_strategy_enabled=task_family_strategy_enabled,
+        single_strategy=single_strategy,
+        multi_strategy=multi_strategy,
+        single_top1_min_pages=single_top1_min_pages,
+    )
+    selected_initial_keys = {_selected_key(row) for row in selected_initial}
+    for row in ranked_pages:
+        row["selected_for_initial_parse"] = _selected_key(row) in selected_initial_keys
+        if row["selected_for_initial_parse"]:
+            selected_row = next((item for item in selected_initial if _selected_key(item) == _selected_key(row)), {})
+            row["selected_by_top1_quota"] = bool(selected_row.get("selected_by_top1_quota"))
+            row["selection_rank"] = selected_row.get("selection_rank")
+    selected_final_raw = [
+        row
+        for row in ranked_pages
+        if _selected_key(row) in selected_initial_keys
     ]
     final_limit = max(initial_limit, int(max_pages_global or 0)) or len(ranked_pages)
+    for row in ranked_pages:
+        if len(selected_final_raw) >= final_limit:
+            break
+        if _selected_key(row) not in selected_initial_keys:
+            selected_final_raw.append(row)
+            selected_initial_keys.add(_selected_key(row))
     selected_final = [
-        {
-            "paper_id": row["paper_id"],
-            "page": row["page"],
-            "global_page_rank": row["global_page_rank"],
-            "candidate_rank": row["candidate_rank"],
-        }
-        for row in ranked_pages[:final_limit]
+        _page_selection_row(row, selected_by_top1_quota=bool(row.get("selected_by_top1_quota")), selection_rank=rank)
+        for rank, row in enumerate(selected_final_raw[:final_limit], start=1)
     ]
     return {
         "query_id": query_id,
         "ranking_source": "native_text",
         "ranking_method": "global_native_text_bm25_rules",
+        "page_ranking_bonus_enabled": page_ranking_bonus_enabled,
+        "page_routing_task_family_strategy_enabled": task_family_strategy_enabled,
+        **quota_info,
         "top_k_papers": len(candidates),
         "total_candidate_pages": len(pool),
         "ranked_pages": ranked_pages,

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import re
+from html import unescape
 from typing import Any
 
 from .data_io import extract_answer_contract
@@ -10,11 +11,12 @@ from .symbolic_schema import OFFICIAL_EVIDENCE_SOURCE_TYPES, to_official_source_
 
 
 FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
+TOKEN_RE = re.compile(r"[A-Za-z0-9]+")
 
 
 def extract_json_object(text: str) -> dict[str, Any]:
     content = text.strip()
-    fence_match = FENCE_RE.search(content)
+    fence_match = FENCE_RE.fullmatch(content) or (FENCE_RE.match(content) if content.startswith("```") else None)
     if fence_match:
         content = fence_match.group(1).strip()
     try:
@@ -72,9 +74,113 @@ def _requested_answer(input_example: dict[str, Any], source_answer: dict[str, An
     return answer
 
 
+def _canonical_table_text(value: Any) -> str:
+    text = unescape(str(value or "")).strip()
+    text = text.replace("–", "-").replace("—", "-").replace("−", "-")
+    text = re.sub(r"\s*-\s*", "-", text)
+    text = re.sub(r"\s+", " ", text)
+    return text
+
+
+def _table_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _canonical_table_text(value).lower())
+
+
+def _question_table_aliases(question: str) -> list[str]:
+    aliases: list[str] = []
+    stop = {
+        "What",
+        "Which",
+        "Across",
+        "Given",
+        "IPC",
+        "FID",
+        "CIFAR",
+        "Tiny",
+        "ImageNet",
+        "ModelNet",
+        "GenEval",
+        "CVPR",
+        "NAACL",
+        "ACL",
+        "ICLR",
+        "ICML",
+        "NeurIPS",
+    }
+    for token in re.findall(r"\b[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*\b", question):
+        if token in stop or len(token) < 2:
+            continue
+        if (
+            any(char.isupper() for char in token[1:])
+            or "-" in token
+            or any(char.isdigit() for char in token)
+            or token.isupper()
+        ):
+            aliases.append(token)
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for alias in aliases:
+        key = _table_key(alias)
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(alias)
+    return deduped
+
+
+def _row_matches_alias(row_key: Any, aliases: list[str]) -> bool:
+    row_norm = _table_key(row_key)
+    if not row_norm:
+        return False
+    for alias in aliases:
+        alias_norm = _table_key(alias)
+        if not alias_norm:
+            continue
+        if row_norm == alias_norm or row_norm in alias_norm or alias_norm in row_norm:
+            return True
+        if len(alias_norm) >= 4 and row_norm[:4] == alias_norm[:4]:
+            return True
+    return False
+
+
+def postprocess_table_rows(
+    rows: list[Any],
+    schema: list[str] | None,
+    input_example: dict[str, Any],
+) -> tuple[list[dict[str, Any]], list[str]]:
+    columns = [str(column) for column in (schema or []) if str(column)]
+    if not columns:
+        return [row for row in rows if isinstance(row, dict)], []
+    errors: list[str] = []
+    normalized: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cleaned = {column: row.get(column) for column in columns}
+        if any(value is not None and str(value).strip() for value in cleaned.values()):
+            normalized.append(cleaned)
+
+    if not normalized:
+        return [], errors
+
+    row_key_column = columns[0]
+    deduped: list[dict[str, Any]] = []
+    seen_keys: set[str] = set()
+    for row in normalized:
+        key = _table_key(row.get(row_key_column))
+        if key and key in seen_keys:
+            errors.append("table_duplicate_row_removed")
+            continue
+        if key:
+            seen_keys.add(key)
+        deduped.append(row)
+
+    return deduped, errors
+
+
 def validate_prediction_against_answer_contract(
     prediction: dict[str, Any],
     answer_contract: dict[str, Any],
+    input_example: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     errors: list[str] = []
     allowed_types = [str(item) for item in answer_contract.get("answer_types", []) if str(item) in {"freeform", "multiple_choice", "table"}]
@@ -100,16 +206,30 @@ def validate_prediction_against_answer_contract(
             text = ""
         if "freeform" not in answer:
             errors.append("missing_required_answer_type")
-        cleaned["freeform"] = {"text": str(text or "")}
+        cleaned["freeform"] = {"text": unescape(str(text or ""))}
     if "multiple_choice" in allowed_types:
         raw = answer.get("multiple_choice") if isinstance(answer.get("multiple_choice"), dict) else {}
         if "multiple_choice" not in answer:
             errors.append("missing_required_answer_type")
-        gold = str(raw.get("gold", "") if isinstance(raw, dict) else "").strip()
+        gold = str(
+            raw.get("gold") or raw.get("answer") or raw.get("predicted_answer_id") or ""
+            if isinstance(raw, dict)
+            else ""
+        ).strip()
         option_keys = set(option_text_by_key)
+        inferred = _infer_multiple_choice_key(gold, cleaned.get("freeform"), option_text_by_key)
+        if inferred:
+            if inferred != gold:
+                errors.append("multiple_choice_key_inferred")
+            gold = inferred
         if gold and option_keys and gold not in option_keys:
-            errors.append("invalid_multiple_choice_option")
-            gold = ""
+            inferred = _infer_multiple_choice_key(gold, cleaned.get("freeform"), option_text_by_key)
+            if inferred:
+                errors.append("multiple_choice_key_inferred")
+                gold = inferred
+            else:
+                errors.append("invalid_multiple_choice_option")
+                gold = ""
         elif gold and not option_keys:
             errors.append("missing_multiple_choice_options")
         cleaned["multiple_choice"] = {"gold": gold}
@@ -128,15 +248,71 @@ def validate_prediction_against_answer_contract(
         rows = raw.get("rows", []) if isinstance(raw, dict) else []
         rows = rows if isinstance(rows, list) else []
         schema = (answer_contract.get("table") or {}).get("table_schema")
+        plan_rows = _rows_from_table_answer_plan(prediction.get("table_answer_plan"), schema)
+        if plan_rows:
+            rows = plan_rows
+            errors.append("table_rows_filled_from_table_answer_plan")
         if isinstance(schema, list) and schema:
             normalized_rows = []
             for row in rows:
                 source_row = row if isinstance(row, dict) else {}
                 normalized_rows.append({str(column): source_row.get(str(column)) for column in schema})
             rows = normalized_rows
+        rows, table_errors = postprocess_table_rows(rows, schema if isinstance(schema, list) else [], input_example or {})
+        errors.extend(table_errors)
+        expected_row_count = int((answer_contract.get("table") or {}).get("expected_row_count") or 0)
+        if expected_row_count > 0 and len(rows) > expected_row_count:
+            rows = rows[:expected_row_count]
+            errors.append("table_rows_limited_to_validation_shape_count")
         cleaned["table"] = {"rows": rows}
     prediction["answer"] = cleaned
     return prediction, errors
+
+
+def _normalize_text_for_choice(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    text = text.strip("\"'“”‘’`")
+    text = re.sub(r"\s+", " ", text)
+    text = text.rstrip(".")
+    return text
+
+
+def _infer_multiple_choice_key(
+    raw_value: Any,
+    freeform: Any,
+    option_text_by_key: dict[str, str],
+) -> str:
+    if not option_text_by_key:
+        upper = str(raw_value or "").strip().upper()
+        match = re.search(r"\b(?:option|answer|choice)?\s*([A-D])\b", upper)
+        return match.group(1) if match else (upper if upper in {"A", "B", "C", "D"} else "")
+
+    allowed_by_upper = {str(key).upper(): str(key) for key in option_text_by_key}
+    upper = str(raw_value or "").strip().upper()
+    if upper in allowed_by_upper:
+        return allowed_by_upper[upper]
+    match = re.search(r"\b(?:option|answer|choice)?\s*([A-Z])\b", upper)
+    if match and match.group(1) in allowed_by_upper:
+        return allowed_by_upper[match.group(1)]
+
+    candidate_texts = [raw_value]
+    if isinstance(freeform, dict):
+        candidate_texts.append(freeform.get("text"))
+    for candidate in candidate_texts:
+        normalized_candidate = _normalize_text_for_choice(candidate)
+        if not normalized_candidate:
+            continue
+        for key, option_text in option_text_by_key.items():
+            normalized_option = _normalize_text_for_choice(option_text)
+            if not normalized_option:
+                continue
+            if (
+                normalized_candidate == normalized_option
+                or normalized_candidate in normalized_option
+                or normalized_option in normalized_candidate
+            ):
+                return key
+    return ""
 
 
 def _selected_evidence_map(selected_evidence: list[dict[str, Any]] | None) -> dict[tuple[str, str], dict[str, set[Any]]]:
@@ -210,6 +386,379 @@ def validate_prediction_locators_against_selected_evidence(
     return prediction, errors
 
 
+def _text_tokens(value: object) -> set[str]:
+    return {token.lower() for token in TOKEN_RE.findall(str(value or "")) if len(token) > 1}
+
+
+def _flatten_text(value: object) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, (int, float, bool)):
+        return str(value)
+    if isinstance(value, list):
+        return " ".join(_flatten_text(item) for item in value)
+    if isinstance(value, dict):
+        return " ".join(_flatten_text(item) for item in value.values())
+    return str(value)
+
+
+def _answer_text(answer: object) -> str:
+    if not isinstance(answer, dict):
+        return ""
+    parts: list[str] = []
+    freeform = answer.get("freeform")
+    if isinstance(freeform, dict):
+        parts.append(str(freeform.get("text") or ""))
+    multiple = answer.get("multiple_choice")
+    if isinstance(multiple, dict):
+        parts.append(str(multiple.get("gold") or ""))
+    table = answer.get("table")
+    if isinstance(table, dict):
+        parts.append(_flatten_text(table.get("rows")))
+    return " ".join(part for part in parts if part)
+
+
+def _evidence_text(evidence: object) -> str:
+    if not isinstance(evidence, dict):
+        return _flatten_text(evidence)
+    fields = [
+        "text",
+        "quote",
+        "snippet",
+        "description",
+        "rationale",
+        "reason",
+        "support",
+        "label",
+        "source_type",
+    ]
+    parts = [str(evidence.get(field) or "") for field in fields]
+    locator = evidence.get("locator")
+    if isinstance(locator, dict):
+        parts.append(_flatten_text(locator))
+    return " ".join(part for part in parts if part)
+
+
+def _is_multi_paper_task(input_example: dict[str, Any], answer_contract: dict[str, Any] | None = None) -> bool:
+    task_family = str(input_example.get("task_family") or "").lower()
+    if "multi" in task_family:
+        return True
+    contract = answer_contract or extract_answer_contract(input_example)
+    answer_types = {str(item) for item in contract.get("answer_types", [])}
+    if "table" in answer_types:
+        return True
+    question = str(input_example.get("question") or "").lower()
+    patterns = [
+        r"\bacross (?:all|the) papers\b",
+        r"\bwhich .* papers\b",
+        r"\bwhat .* each\b",
+        r"\blist\b.*\bpapers?\b",
+        r"\bcompare[sd]?\b",
+        r"\bamong\b.*\bpapers?\b",
+        r"\brespectively\b",
+    ]
+    return any(re.search(pattern, question) for pattern in patterns)
+
+
+def _label_to_locator(source_type: str, label: Any) -> dict[str, Any]:
+    text = str(label or "").strip()
+    if not text:
+        return {}
+    if source_type == "table":
+        return {"table_id": text}
+    if source_type == "figure":
+        return {"figure_id": text}
+    lowered = text.lower()
+    if source_type == "equation_algorithm":
+        if "algorithm" in lowered:
+            return {"algorithm_id": text}
+        if "equation" in lowered or re.search(r"\b(?:eq\.?|formula)\b", lowered):
+            return {"equation_id": text}
+    if source_type == "citation_context":
+        return {"citation_id": text}
+    return {}
+
+
+def _evidence_from_contributing_papers(value: Any, candidate_set: set[str]) -> tuple[list[dict[str, Any]], list[str]]:
+    if not isinstance(value, list):
+        return [], []
+    evidence: list[dict[str, Any]] = []
+    paper_ids: list[str] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        paper_id = str(item.get("paper_id") or "")
+        if not paper_id or paper_id not in candidate_set:
+            continue
+        if paper_id not in paper_ids:
+            paper_ids.append(paper_id)
+        supporting = item.get("supporting_evidence") if isinstance(item.get("supporting_evidence"), list) else []
+        for support in supporting:
+            if not isinstance(support, dict):
+                continue
+            source_type = to_official_source_type(source_type=str(support.get("source_type") or "")) or "text_span"
+            locator: dict[str, Any] = {}
+            try:
+                locator["page"] = int(support.get("page"))
+            except (TypeError, ValueError):
+                continue
+            locator.update(_label_to_locator(source_type, support.get("label")))
+            evidence.append({"paper_id": paper_id, "source_type": source_type, "locator": locator})
+    return evidence, paper_ids
+
+
+def _normalize_column_name(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def _coerce_table_value(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if re.fullmatch(r"[-+]?\d+", text):
+            try:
+                return int(text)
+            except ValueError:
+                return text
+        if re.fullmatch(r"[-+]?(?:\d+\.\d*|\.\d+)", text):
+            try:
+                return float(text)
+            except ValueError:
+                return text
+        return text
+    return value
+
+
+def _rows_from_table_answer_plan(value: Any, schema: list[str] | None) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    columns = [str(column) for column in (schema or []) if str(column)]
+    rows: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        values = item.get("values") if isinstance(item.get("values"), dict) else item
+        if not isinstance(values, dict):
+            continue
+        by_normalized = {_normalize_column_name(key): values.get(key) for key in values}
+        if columns:
+            row = {
+                column: _coerce_table_value(values[column] if column in values else by_normalized.get(_normalize_column_name(column)))
+                for column in columns
+            }
+        else:
+            row = {str(key): _coerce_table_value(val) for key, val in values.items() if key not in {"row_source", "source", "evidence"}}
+        if any(value is not None and str(value).strip() for value in row.values()):
+            rows.append(row)
+    return rows
+
+
+def _evidence_from_table_answer_plan(value: Any, candidate_set: set[str]) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    evidence: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, dict):
+            continue
+        source = item.get("row_source") if isinstance(item.get("row_source"), dict) else item.get("source")
+        if not isinstance(source, dict):
+            continue
+        paper_id = str(source.get("paper_id") or "")
+        if not paper_id or paper_id not in candidate_set:
+            continue
+        locator: dict[str, Any] = {}
+        try:
+            locator["page"] = int(source.get("page"))
+        except (TypeError, ValueError):
+            continue
+        locator.update(_label_to_locator("table", source.get("label") or source.get("table_id")))
+        evidence.append({"paper_id": paper_id, "source_type": "table", "locator": locator})
+    return evidence
+
+
+def _selected_evidence_text(evidence: dict[str, Any]) -> str:
+    grounding = evidence.get("grounding_label")
+    grounding_text = ""
+    if isinstance(grounding, dict):
+        grounding_text = f"{grounding.get('type') or ''} {grounding.get('value') or ''}"
+    return " ".join(
+        str(part or "")
+        for part in [
+            evidence.get("text"),
+            evidence.get("label"),
+            evidence.get("source_type"),
+            evidence.get("page"),
+            grounding_text,
+        ]
+    )
+
+
+def _token_overlap_score(query_text: str, candidate_text: str) -> float:
+    query_tokens = _text_tokens(query_text)
+    candidate_tokens = _text_tokens(candidate_text)
+    if not query_tokens or not candidate_tokens:
+        return 0.0
+    overlap = len(query_tokens & candidate_tokens)
+    precision = overlap / max(1, len(candidate_tokens))
+    recall = overlap / max(1, len(query_tokens))
+    return (2.0 * precision * recall / (precision + recall)) if precision + recall else 0.0
+
+
+def _locator_from_selected_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
+    locator: dict[str, Any] = {}
+    try:
+        locator["page"] = int(evidence.get("page"))
+    except (TypeError, ValueError):
+        return {}
+    grounding = evidence.get("grounding_label")
+    if isinstance(grounding, dict):
+        label_type = str(grounding.get("type") or "").strip()
+        value = str(grounding.get("value") or "").strip()
+        if label_type in {"table_id", "figure_id", "equation_id", "algorithm_id", "citation_id", "reference_id"} and value:
+            locator[label_type] = value
+    return locator
+
+
+def _evidence_locator_is_allowed(evidence: dict[str, Any], selected_evidence: list[dict[str, Any]]) -> bool:
+    probe = {"evidence": [evidence]}
+    validated, errors = validate_prediction_locators_against_selected_evidence(probe, selected_evidence)
+    return not errors and bool(validated.get("evidence"))
+
+
+def _best_symbolic_evidence(
+    query_text: str,
+    predicted_paper_ids: list[str],
+    raw_evidence: dict[str, Any] | None,
+    selected_evidence: list[dict[str, Any]],
+    primary_evidence_type: str,
+) -> dict[str, Any] | None:
+    if not selected_evidence:
+        return None
+    predicted_set = {paper_id for paper_id in predicted_paper_ids if paper_id}
+    raw_paper_id = str((raw_evidence or {}).get("paper_id") or "")
+    raw_source_type = to_official_source_type(source_type=str((raw_evidence or {}).get("source_type") or "")) or ""
+    raw_locator = (raw_evidence or {}).get("locator") if isinstance((raw_evidence or {}).get("locator"), dict) else {}
+    raw_page = None
+    try:
+        raw_page = int(raw_locator.get("page")) if isinstance(raw_locator, dict) and raw_locator.get("page") is not None else None
+    except (TypeError, ValueError):
+        raw_page = None
+
+    candidates = [item for item in selected_evidence if isinstance(item, dict)]
+    if raw_paper_id:
+        same_paper = [item for item in candidates if str(item.get("paper_id") or "") == raw_paper_id]
+        if not same_paper:
+            return None
+        candidates = same_paper
+    elif predicted_set:
+        same_prediction = [item for item in candidates if str(item.get("paper_id") or "") in predicted_set]
+        if not same_prediction:
+            return None
+        candidates = same_prediction
+
+    evidence_query = " ".join([query_text, _evidence_text(raw_evidence or {})]).strip()
+    best: tuple[float, dict[str, Any]] | None = None
+    for index, item in enumerate(candidates):
+        score = _token_overlap_score(evidence_query, _selected_evidence_text(item))
+        if primary_evidence_type and str(item.get("source_type") or "") == primary_evidence_type:
+            score += 1.2
+        if raw_source_type and str(item.get("source_type") or "") == raw_source_type:
+            score += 1.0
+        if raw_page is not None and item.get("page") == raw_page:
+            score += 0.7
+        if raw_paper_id and str(item.get("paper_id") or "") == raw_paper_id:
+            score += 0.5
+        score -= index * 0.001
+        if best is None or score > best[0]:
+            best = (score, item)
+    return best[1] if best else None
+
+
+def standardize_symbolic_evidence(
+    prediction: dict[str, Any],
+    input_example: dict[str, Any],
+    selected_evidence: list[dict[str, Any]] | None,
+) -> tuple[dict[str, Any], list[str]]:
+    """Map model evidence claims to the closest selected symbolic evidence locator.
+
+    This is a deterministic postprocess over already-selected symbolic records.
+    It does not expose scores to VLM-2 and does not introduce evidence outside
+    the selected symbolic context.
+    """
+    selected = [item for item in (selected_evidence or []) if isinstance(item, dict)]
+    if not selected:
+        return prediction, []
+    errors: list[str] = []
+    predicted_ids = [
+        str(item.get("paper_id") or "")
+        for item in prediction.get("gold_papers", [])
+        if isinstance(item, dict) and item.get("paper_id")
+    ]
+    primary_type = to_official_source_type(source_type=str(input_example.get("primary_evidence_type") or "")) or "text_span"
+    query_text = " ".join([str(input_example.get("question") or ""), _answer_text(prediction.get("answer"))]).strip()
+    raw_evidence = prediction.get("evidence") if isinstance(prediction.get("evidence"), list) else []
+    standardized: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, int, tuple[tuple[str, str], ...]]] = set()
+
+    for item in raw_evidence:
+        if not isinstance(item, dict):
+            errors.append("symbolic_evidence_non_object_replaced")
+            item = {}
+        if item and _evidence_locator_is_allowed(item, selected):
+            paper_id = str(item.get("paper_id") or "")
+            source_type = to_official_source_type(source_type=str(item.get("source_type") or "")) or "text_span"
+            locator = item.get("locator") if isinstance(item.get("locator"), dict) else {}
+            try:
+                page = int(locator.get("page"))
+            except (TypeError, ValueError):
+                page = 0
+            id_items = tuple(sorted((str(k), str(v)) for k, v in locator.items() if k != "page" and v))
+            key = (paper_id, source_type, page, id_items)
+            if key not in seen:
+                seen.add(key)
+                standardized.append({"paper_id": paper_id, "source_type": source_type, "locator": {"page": page, **{k: v for k, v in locator.items() if k != "page" and v}}})
+            continue
+
+        best = _best_symbolic_evidence(query_text, predicted_ids, item, selected, primary_type)
+        if not best:
+            best = _best_symbolic_evidence(query_text, [], None, selected, primary_type)
+        if not best:
+            errors.append("symbolic_evidence_standardization_no_match")
+            continue
+        locator = _locator_from_selected_evidence(best)
+        if not locator:
+            errors.append("symbolic_evidence_standardization_no_locator")
+            continue
+        paper_id = str(best.get("paper_id") or "")
+        source_type = str(best.get("source_type") or primary_type)
+        id_items = tuple(sorted((str(k), str(v)) for k, v in locator.items() if k != "page" and v))
+        key = (paper_id, source_type, int(locator["page"]), id_items)
+        if key in seen:
+            continue
+        seen.add(key)
+        standardized.append({"paper_id": paper_id, "source_type": source_type, "locator": locator})
+        errors.append("symbolic_evidence_locator_standardized")
+
+    if not standardized:
+        best = _best_symbolic_evidence(query_text, predicted_ids, None, selected, primary_type)
+        if not best:
+            best = _best_symbolic_evidence(query_text, [], None, selected, primary_type)
+        if best:
+            locator = _locator_from_selected_evidence(best)
+            if locator:
+                standardized.append(
+                    {
+                        "paper_id": str(best.get("paper_id") or ""),
+                        "source_type": str(best.get("source_type") or primary_type),
+                        "locator": locator,
+                    }
+                )
+                errors.append("symbolic_evidence_empty_filled")
+    prediction["evidence"] = standardized
+    return prediction, errors
+
+
 def make_fallback_prediction(input_example: dict[str, Any], top1_candidate: dict[str, Any] | None) -> dict[str, Any]:
     paper_id = (top1_candidate or {}).get("paper_id", "")
     gold_papers = [{"paper_id": paper_id}] if paper_id else []
@@ -227,12 +776,21 @@ def normalize_prediction(
     candidate_paper_ids: list[str],
     answer_contract: dict[str, Any] | None = None,
     selected_evidence: list[dict[str, Any]] | None = None,
+    symbolic_evidence_standardization: bool = True,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     query_id = input_example.get("query_id")
     errors: list[dict[str, Any]] = []
     allow_noncandidate = os.environ.get("ALLOW_NONCANDIDATE_PAPERS", "").lower() == "true"
     candidate_set = set(candidate_paper_ids)
     top1 = candidate_paper_ids[0] if candidate_paper_ids else ""
+    contract = answer_contract or extract_answer_contract(input_example)
+    is_multi_paper = _is_multi_paper_task(input_example, contract)
+    contribution_evidence, contribution_paper_ids = _evidence_from_contributing_papers(obj.get("contributing_papers"), candidate_set)
+    raw_answer = obj.get("answer") if isinstance(obj.get("answer"), dict) else {}
+    table_answer_plan = obj.get("table_answer_plan")
+    if not isinstance(table_answer_plan, list) and isinstance(raw_answer.get("table_answer_plan"), list):
+        table_answer_plan = raw_answer.get("table_answer_plan")
+    table_plan_evidence = _evidence_from_table_answer_plan(table_answer_plan, candidate_set)
 
     raw_papers = obj.get("gold_papers") or obj.get("papers") or []
     normalized_papers: list[dict[str, str]] = []
@@ -247,19 +805,47 @@ def normalize_prediction(
                 paper_id = top1
             if paper_id and {"paper_id": paper_id} not in normalized_papers:
                 normalized_papers.append({"paper_id": paper_id})
+    if is_multi_paper:
+        for paper_id in contribution_paper_ids:
+            if paper_id and {"paper_id": paper_id} not in normalized_papers:
+                normalized_papers.append({"paper_id": paper_id})
+                errors.append({"query_id": query_id, "type": "gold_paper_filled_from_contributing_papers", "paper_id": paper_id})
     if not normalized_papers and top1:
         errors.append({"query_id": query_id, "type": "fallback_paper_id", "replacement": top1})
         normalized_papers = [{"paper_id": top1}]
 
-    evidence = _normalize_official_evidence(obj.get("evidence", []))
+    raw_evidence = obj.get("evidence", [])
+    if isinstance(raw_evidence, list) and contribution_evidence:
+        raw_evidence = [*raw_evidence, *contribution_evidence]
+        errors.append({"query_id": query_id, "type": "evidence_extended_from_contributing_papers", "count": len(contribution_evidence)})
+    if isinstance(raw_evidence, list) and table_plan_evidence:
+        raw_evidence = [*raw_evidence, *table_plan_evidence]
+        errors.append({"query_id": query_id, "type": "evidence_extended_from_table_answer_plan", "count": len(table_plan_evidence)})
+    evidence = _normalize_official_evidence(raw_evidence)
     if not isinstance(evidence, list):
         errors.append({"query_id": query_id, "type": "invalid_evidence_replaced"})
         evidence = []
-    contract = answer_contract or extract_answer_contract(input_example)
-    answer = obj.get("answer") if isinstance(obj.get("answer"), dict) else {}
-    pred = {"query_id": query_id, "gold_papers": normalized_papers, "evidence": evidence, "answer": answer}
+    answer = raw_answer
+    pred = {
+        "query_id": query_id,
+        "gold_papers": normalized_papers,
+        "evidence": evidence,
+        "answer": answer,
+        "contributing_papers": obj.get("contributing_papers") if isinstance(obj.get("contributing_papers"), list) else [],
+        "table_answer_plan": table_answer_plan if isinstance(table_answer_plan, list) else [],
+    }
+    if symbolic_evidence_standardization:
+        pred, standardization_errors = standardize_symbolic_evidence(pred, input_example, selected_evidence)
+        for error_type in standardization_errors:
+            errors.append({"query_id": query_id, "type": error_type})
     pred, locator_errors = validate_prediction_locators_against_selected_evidence(pred, selected_evidence)
-    pred, answer_errors = validate_prediction_against_answer_contract(pred, contract)
+    if is_multi_paper and isinstance(pred.get("evidence"), list):
+        for item in pred.get("evidence") or []:
+            paper_id = str(item.get("paper_id") or "") if isinstance(item, dict) else ""
+            if paper_id and paper_id in candidate_set and {"paper_id": paper_id} not in pred["gold_papers"]:
+                pred["gold_papers"].append({"paper_id": paper_id})
+                errors.append({"query_id": query_id, "type": "gold_paper_filled_from_evidence", "paper_id": paper_id})
+    pred, answer_errors = validate_prediction_against_answer_contract(pred, contract, input_example)
     for error_type in locator_errors + answer_errors:
         errors.append({"query_id": query_id, "type": error_type})
     return pred, errors
@@ -302,6 +888,8 @@ def strip_internal_grounding(value: Any) -> Any:
         "label",
         "image_ref",
         "vlm_parse_confidence",
+        "contributing_papers",
+        "table_answer_plan",
     }
     if isinstance(value, list):
         return [strip_internal_grounding(item) for item in value]

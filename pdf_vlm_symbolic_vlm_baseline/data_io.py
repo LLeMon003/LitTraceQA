@@ -139,6 +139,12 @@ def _find_validation_table_schema(validation_example: dict[str, Any] | None) -> 
     return _find_first(validation_example or {}, ["table_schema", "columns", "schema"])
 
 
+def _find_validation_table_row_count(validation_example: dict[str, Any] | None) -> int:
+    table = _find_gold_answer_container(validation_example, "table")
+    rows = table.get("rows") if isinstance(table, dict) else None
+    return len(rows) if isinstance(rows, list) else 0
+
+
 def extract_answer_contract(input_example: dict[str, Any], validation_example: dict[str, Any] | None = None) -> dict[str, Any]:
     """Extract inference-available answer constraints from a validation input row.
 
@@ -155,6 +161,7 @@ def extract_answer_contract(input_example: dict[str, Any], validation_example: d
     if table_value is None:
         table_value = _find_validation_table_schema(validation_example)
     table_schema = _normalize_table_schema(table_value)
+    table_expected_row_count = _find_validation_table_row_count(validation_example)
     options = _normalize_options(option_value)
     return {
         "query_id": input_example.get("query_id"),
@@ -168,6 +175,7 @@ def extract_answer_contract(input_example: dict[str, Any], validation_example: d
         "table": {
             "table_schema": table_schema,
             "output_rule": "use exactly the provided column names if table answer is required",
+            "expected_row_count": table_expected_row_count,
         },
         "freeform": {
             "output_rule": "produce concise text only if freeform is listed in answer_types",

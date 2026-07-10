@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from statistics import mean
@@ -148,6 +149,7 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- selection_mode: `{stats['selection_mode']}`",
         f"- direct_mode_is_diagnostic_only: {stats['selection_mode'] == 'direct'}",
         f"- answer_model: `{stats['answer_model']}`",
+        f"- metadata_only_retrieval_eval_model: `{stats['metadata_only_retrieval_eval_model']}`",
         f"- vlm2_selection_calls: {stats['vlm2_selection_calls']}",
         f"- vlm2_selection_failures: {stats['vlm2_selection_failures']}",
         f"- processed_queries: {stats['processed_queries']}",
@@ -178,7 +180,8 @@ def main() -> int:
         path.write_text("", encoding="utf-8")
 
     config = load_pipeline_config(args.env_path)
-    answer_client = VLMAnswerClient(config)
+    metadata_selection_config = replace(config, answer_model=config.metadata_only_retrieval_eval_model)
+    answer_client = VLMAnswerClient(metadata_selection_config)
     inputs = read_jsonl(find_official_file(args.official_dir, "validation_inputs.jsonl"))
     if args.max_queries is not None:
         inputs = inputs[: args.max_queries]
@@ -264,6 +267,7 @@ def main() -> int:
         "paper_output_mode": args.paper_output_mode,
         "selection_mode": args.selection_mode,
         "answer_model": config.answer_model,
+        "metadata_only_retrieval_eval_model": metadata_selection_config.answer_model,
         "vlm2_selection_calls": len(predictions) if args.selection_mode == "vlm2" else 0,
         "vlm2_selection_failures": sum(
             1

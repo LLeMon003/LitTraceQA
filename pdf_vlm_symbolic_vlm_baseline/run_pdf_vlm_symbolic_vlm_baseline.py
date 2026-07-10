@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import signal
 import shutil
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -49,6 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default="outputs/pdf_vlm_symbolic_vlm_baseline")
     p.add_argument("--pdf-output-dir", default="raw_pdfs")
     p.add_argument("--processed-output-dir", default="processed_pdfs/vlm_symbolic")
+    p.add_argument("--symbolic-cache-root", default=None, help="Optional symbolic cache root override. Pass a vlm_symbolic_runs/<batch> directory to read/write <parser_slug>/<paper_id> caches there.")
     p.add_argument("--top-k-papers", type=int, default=5)
     p.add_argument("--top-n-records", type=int, default=24)
     p.add_argument("--top-n-visual-records", type=int, default=6)
@@ -227,6 +230,340 @@ def _read_page_runtime_cache(paper_dir: Path, page: int) -> list[dict[str, Any]]
     return _runtime_records_with_status(_read_symbolic(runtime_path), paper_dir)
 
 
+def _resolve_structured_root(processed_root: Path, parser_model_slug: str, symbolic_cache_root: str | None) -> tuple[Path, bool, str]:
+    value = str(symbolic_cache_root or "").strip()
+    if not value:
+        return processed_root / parser_model_slug, False, ""
+    root = Path(value)
+    if root.name == parser_model_slug:
+        return root, True, value
+    return root / parser_model_slug, True, value
+
+
+def _normalize_runtime_records(records: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+    normalized: list[dict[str, Any]] = []
+    changed = False
+    expected = {"paper_id", "page", "record_id", "global_record_id", "record_type", "source_type", "label", "locator", "text", "reading_order"}
+    for record in records:
+        runtime = migrate_legacy_record_to_runtime(record)
+        normalized.append(runtime)
+        if set(record.keys()) != expected or any(record.get(key) != runtime.get(key) for key in expected):
+            changed = True
+    return normalized, changed
+
+
+def _infer_page_status_from_records(
+    *,
+    paper_id: str,
+    page: int,
+    records: list[dict[str, Any]],
+    parser_model: str,
+    artifact_version: str,
+    parser_mode: str,
+    render_dpi: int,
+    existing_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    existing_status = existing_status or {}
+    page_status = str(existing_status.get("page_status") or "")
+    if records and page_status not in {"complete", "partial"}:
+        page_status = "partial" if records else "failed"
+    elif not records and page_status not in {"complete", "partial", "failed"}:
+        page_status = "failed"
+    return {
+        "paper_id": paper_id,
+        "page": page,
+        "parser_model": parser_model,
+        "render_dpi": render_dpi,
+        "artifact_version": artifact_version,
+        "parser_mode": parser_mode,
+        "page_status": page_status,
+        "pass_count": int(existing_status.get("pass_count") or 0),
+        "valid_record_count": len(records),
+        "rejected_record_count": int(existing_status.get("rejected_record_count") or 0),
+        "deduplicated_record_count": int(existing_status.get("deduplicated_record_count") or 0),
+        "needs_continuation_final": bool(existing_status.get("needs_continuation_final", page_status == "partial")),
+        "known_omissions": existing_status.get("known_omissions") if isinstance(existing_status.get("known_omissions"), list) else [],
+        "failure_reason": str(existing_status.get("failure_reason") or ""),
+        "created_at": str(existing_status.get("created_at") or datetime.now(timezone.utc).isoformat()),
+    }
+
+
+def _manifest_page_lookup(paper_dir: Path) -> dict[int, dict[str, Any]]:
+    manifest = _load_json(paper_dir / "document_manifest.json") or {}
+    lookup: dict[int, dict[str, Any]] = {}
+    for page_info in manifest.get("pages", []) if isinstance(manifest.get("pages"), list) else []:
+        if not isinstance(page_info, dict):
+            continue
+        try:
+            lookup[int(page_info.get("page") or 0)] = page_info
+        except (TypeError, ValueError):
+            continue
+    return lookup
+
+
+def _raw_parser_content(raw_path: Path) -> str:
+    raw = _load_json(raw_path) or {}
+    if raw.get("content") is not None:
+        return str(raw.get("content") or "")
+    raw_response = raw.get("raw_response")
+    if isinstance(raw_response, dict):
+        choices = raw_response.get("choices")
+        if isinstance(choices, list) and choices:
+            message = choices[0].get("message") if isinstance(choices[0], dict) else {}
+            if isinstance(message, dict) and message.get("content") is not None:
+                return str(message.get("content") or "")
+    return ""
+
+
+def _raw_response_finish_reason(result: dict[str, Any] | None) -> str:
+    if not isinstance(result, dict):
+        return ""
+    raw_response = result.get("raw_response")
+    if not isinstance(raw_response, dict):
+        return ""
+    choices = raw_response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return ""
+    first = choices[0] if isinstance(choices[0], dict) else {}
+    return str(first.get("finish_reason") or "")
+
+
+def _rebuild_page_records_from_raw(
+    paper_dir: Path,
+    *,
+    paper_id: str,
+    page: int,
+    parser_model: str,
+    artifact_version: str,
+    parser_mode: str,
+    render_dpi: int,
+) -> bool:
+    raw_paths = sorted((paper_dir / "page_parser_raw").glob(f"page_{page:03d}_pass_*.raw.json"))
+    if not raw_paths:
+        return False
+    page_info = _manifest_page_lookup(paper_dir).get(page, {})
+    page_width = int(page_info.get("width_px") or 0)
+    page_height = int(page_info.get("height_px") or 0)
+    page_records: list[dict[str, Any]] = []
+    seen_signatures: set[tuple[str, str, str]] = set()
+    rejected = 0
+    deduplicated = 0
+    needs_continuation = False
+    known_omissions: list[Any] = []
+    failure_reason = ""
+    pass_count = 0
+    for raw_path in raw_paths:
+        match = re.search(r"_pass_(\d+)\.raw\.json$", raw_path.name)
+        pass_index = int(match.group(1)) if match else len(page_records) + 1
+        pass_count = max(pass_count, pass_index)
+        content = _raw_parser_content(raw_path)
+        if not content.strip():
+            failure_reason = "raw parser response had empty content"
+            continue
+        try:
+            raw_obj = extract_json_object(content)
+        except Exception as exc:
+            failure_reason = str(exc)
+            continue
+        repaired = validate_page_structure(raw_obj, paper_id, page, parser_mode)
+        records = normalize_page_records(
+            repaired,
+            parser_model,
+            page_width,
+            page_height,
+            artifact_version=artifact_version,
+            parser_mode=parser_mode,
+            page_status="partial",
+            start_index=len(page_records) + 1,
+            pass_index=pass_index,
+        )
+        for record in records:
+            signature = _record_signature(record)
+            if signature in seen_signatures:
+                deduplicated += 1
+                continue
+            seen_signatures.add(signature)
+            page_records.append(record)
+        coverage = repaired.get("coverage") if isinstance(repaired.get("coverage"), dict) else {}
+        needs_continuation = bool(coverage.get("needs_continuation"))
+        known_omissions.extend(coverage.get("known_omissions") if isinstance(coverage.get("known_omissions"), list) else [])
+        if not needs_continuation:
+            break
+    valid_page_records = [record for record in page_records if record.get("validation_status") != "rejected"]
+    rejected = sum(1 for record in page_records if record.get("validation_status") == "rejected")
+    if not valid_page_records:
+        return False
+    page_status = "partial" if needs_continuation or failure_reason else "complete"
+    for record in page_records:
+        record["page_status"] = page_status
+    page_records_dir = paper_dir / "page_records"
+    page_status_dir = paper_dir / "page_status"
+    page_records_dir.mkdir(parents=True, exist_ok=True)
+    page_status_dir.mkdir(parents=True, exist_ok=True)
+    write_jsonl(page_records_dir / f"page_{page:03d}.records.debug.jsonl", page_records)
+    write_jsonl(page_records_dir / f"page_{page:03d}.records.runtime.jsonl", [to_runtime_record(record) for record in valid_page_records])
+    status = _infer_page_status_from_records(
+        paper_id=paper_id,
+        page=page,
+        records=valid_page_records,
+        parser_model=parser_model,
+        artifact_version=artifact_version,
+        parser_mode=parser_mode,
+        render_dpi=render_dpi,
+        existing_status={
+            "page_status": page_status,
+            "pass_count": pass_count,
+            "rejected_record_count": rejected,
+            "deduplicated_record_count": deduplicated,
+            "needs_continuation_final": needs_continuation,
+            "known_omissions": known_omissions,
+            "failure_reason": failure_reason,
+        },
+    )
+    (page_status_dir / f"page_{page:03d}.status.json").write_text(json.dumps(status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return True
+
+
+def _normalize_existing_symbolic_cache_for_paper(
+    paper_dir: Path,
+    *,
+    paper_id: str,
+    parser_model: str,
+    artifact_version: str,
+    parser_mode: str,
+    render_dpi: int,
+    stats: dict[str, Any],
+) -> None:
+    if not paper_dir.exists():
+        return
+    page_records_dir = paper_dir / "page_records"
+    page_status_dir = paper_dir / "page_status"
+    page_status_dir.mkdir(parents=True, exist_ok=True)
+    normalized_any = False
+    page_runtime_paths = sorted(page_records_dir.glob("page_*.records.runtime.jsonl")) if page_records_dir.exists() else []
+    for runtime_path in page_runtime_paths:
+        match = re.search(r"page_(\d+)\.records\.runtime\.jsonl$", runtime_path.name)
+        if not match:
+            continue
+        page = int(match.group(1))
+        records, changed = _normalize_runtime_records(_read_symbolic(runtime_path))
+        if changed:
+            write_jsonl(runtime_path, records)
+            normalized_any = True
+        status_path = page_status_dir / f"page_{page:03d}.status.json"
+        status = _load_json(status_path) or {}
+        status_current = (
+            status.get("parser_model") == parser_model
+            and status.get("artifact_version") == artifact_version
+            and status.get("parser_mode") == parser_mode
+            and int(status.get("render_dpi") or render_dpi) == render_dpi
+            and status.get("page_status") in {"complete", "partial", "failed"}
+        )
+        if not status_current:
+            status_path.write_text(
+                json.dumps(
+                    _infer_page_status_from_records(
+                        paper_id=paper_id,
+                        page=page,
+                        records=records,
+                        parser_model=parser_model,
+                        artifact_version=artifact_version,
+                        parser_mode=parser_mode,
+                        render_dpi=render_dpi,
+                        existing_status=status,
+                    ),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            normalized_any = True
+    raw_pages: set[int] = set()
+    for raw_path in sorted((paper_dir / "page_parser_raw").glob("page_*_pass_*.raw.json")):
+        match = re.search(r"page_(\d+)_pass_\d+\.raw\.json$", raw_path.name)
+        if match:
+            raw_pages.add(int(match.group(1)))
+    for page in sorted(raw_pages):
+        runtime_path = page_records_dir / f"page_{page:03d}.records.runtime.jsonl"
+        status = _load_json(page_status_dir / f"page_{page:03d}.status.json") or {}
+        runtime_empty = not runtime_path.exists() or runtime_path.stat().st_size == 0
+        if runtime_empty or status.get("page_status") == "failed":
+            if _rebuild_page_records_from_raw(
+                paper_dir,
+                paper_id=paper_id,
+                page=page,
+                parser_model=parser_model,
+                artifact_version=artifact_version,
+                parser_mode=parser_mode,
+                render_dpi=render_dpi,
+            ):
+                normalized_any = True
+
+    paper_records = _collect_paper_runtime_from_page_files(paper_dir)
+    symbolic_path = paper_dir / "symbolic_records.runtime.jsonl"
+    if symbolic_path.exists():
+        records, changed = _normalize_runtime_records(_read_symbolic(symbolic_path))
+        if changed:
+            write_jsonl(symbolic_path, records)
+            normalized_any = True
+    elif paper_records:
+        write_jsonl(symbolic_path, paper_records)
+        normalized_any = True
+    elif (paper_dir / "symbolic_records.jsonl").exists():
+        migrated = _migrate_legacy_records(paper_dir)
+        if migrated:
+            write_jsonl(symbolic_path, migrated)
+            paper_records = migrated
+            normalized_any = True
+
+    page_statuses = _read_page_status_by_page(paper_dir)
+    if paper_records:
+        complete_pages = sum(1 for value in page_statuses.values() if value == "complete")
+        partial_pages = sum(1 for value in page_statuses.values() if value == "partial")
+        failed_pages = sum(1 for value in page_statuses.values() if value == "failed")
+        paper_status = "complete" if complete_pages and partial_pages == 0 and failed_pages == 0 else "partial"
+    else:
+        complete_pages = partial_pages = 0
+        failed_pages = len(page_statuses)
+        paper_status = "failed"
+    status_path = paper_dir / "artifact_status.json"
+    status = _load_json(status_path) or {}
+    status_current = (
+        status.get("parser_model") == parser_model
+        and status.get("artifact_version") == artifact_version
+        and status.get("parser_mode") == parser_mode
+        and int(status.get("render_dpi") or render_dpi) == render_dpi
+        and status.get("status") in {"complete", "partial", "failed"}
+    )
+    if not status_current:
+        artifact_status = {
+            "paper_id": paper_id,
+            "parser_model": parser_model,
+            "render_dpi": render_dpi,
+            "artifact_version": artifact_version,
+            "parser_mode": parser_mode,
+            "symbolic_records_runtime_path": str(symbolic_path),
+            "symbolic_records_debug_path": str(paper_dir / "symbolic_records.debug.jsonl"),
+            "page_count": int(status.get("page_count") or 0),
+            "parsed_pages": complete_pages + partial_pages,
+            "complete_pages": complete_pages,
+            "partial_pages": partial_pages,
+            "failed_pages": failed_pages,
+            "valid_record_count": len(paper_records),
+            "rejected_record_count": int(status.get("rejected_record_count") or 0),
+            "deduplicated_record_count": int(status.get("deduplicated_record_count") or 0),
+            "created_at": str(status.get("created_at") or datetime.now(timezone.utc).isoformat()),
+            "status": paper_status,
+            "cache_reusable_as_complete": paper_status == "complete",
+            "page_level_cache_reusable": bool(paper_records),
+        }
+        status_path.write_text(json.dumps(artifact_status, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        normalized_any = True
+    if normalized_any:
+        stats["symbolic_cache_records_standardized"] = int(stats.get("symbolic_cache_records_standardized") or 0) + 1
+
+
 def _collect_paper_runtime_from_page_files(paper_dir: Path) -> list[dict[str, Any]]:
     page_records_dir = paper_dir / "page_records"
     rows: list[dict[str, Any]] = []
@@ -333,6 +670,16 @@ def _parse_rows_for_pages(
         if selected_pages_by_paper is not None and not selected_pages:
             continue
         paper_dir = structured_root / paper_id
+        if stats.get("symbolic_cache_root_override_enabled"):
+            _normalize_existing_symbolic_cache_for_paper(
+                paper_dir,
+                paper_id=paper_id,
+                parser_model=config.parser_model,
+                artifact_version=config.symbolic_artifact_version,
+                parser_mode=config.parser_extraction_mode,
+                render_dpi=render_dpi,
+                stats=stats,
+            )
         symbolic_path = paper_dir / "symbolic_records.runtime.jsonl"
         debug_symbolic_path = paper_dir / "symbolic_records.debug.jsonl"
         status_path = paper_dir / "artifact_status.json"
@@ -526,6 +873,13 @@ def _prompt_context_stats(selected_prompt: dict[str, Any], stats: dict[str, Any]
         )
     stats["primary_evidence_selected_count"] += int(selected_prompt.get("primary_evidence_type_count") or 0)
     stats["supporting_evidence_selected_count"] += int(selected_prompt.get("supporting_evidence_count") or 0)
+    if selected_prompt.get("context_truncated"):
+        stats["vlm2_context_truncated_count"] += 1
+    completed = max(1, int(stats.get("processed_queries") or 0) + 1)
+    stats["average_vlm2_selected_records_per_query"] = round(
+        float(stats.get("vlm2_prompt_evidence_record_count") or 0) / completed,
+        3,
+    )
     for label_type, count_value in (selected_prompt.get("grounding_label_hints_by_type") or {}).items():
         stats["grounding_label_hints_by_type"][str(label_type)] = (
             int(stats["grounding_label_hints_by_type"].get(str(label_type), 0)) + int(count_value or 0)
@@ -558,6 +912,16 @@ def _update_normalization_error_stats(errors: list[dict[str, Any]], stats: dict[
             stats["invented_grounding_labels_removed_count"] += 1
         elif error_type == "locator_validation_error":
             stats["locator_validation_errors_count"] += 1
+        elif error_type == "symbolic_evidence_locator_standardized":
+            stats["symbolic_evidence_locator_standardized_count"] += 1
+        elif error_type == "symbolic_evidence_empty_filled":
+            stats["symbolic_evidence_empty_filled_count"] += 1
+        elif error_type == "symbolic_evidence_non_object_replaced":
+            stats["symbolic_evidence_non_object_replaced_count"] += 1
+        elif error_type == "symbolic_evidence_standardization_no_match":
+            stats["symbolic_evidence_standardization_no_match_count"] += 1
+        elif error_type == "symbolic_evidence_standardization_no_locator":
+            stats["symbolic_evidence_standardization_no_locator_count"] += 1
 
 
 def _empty_answer_for_sample(sample: dict[str, Any]) -> dict[str, Any]:
@@ -776,9 +1140,11 @@ def _parse_paper(
                 )
             raw_obj: dict[str, Any] | None = None
             last_exc: Exception | None = None
+            last_result: dict[str, Any] | None = None
             for attempt in range(retry_on_json_failure + 1):
                 try:
                     result = parser.generate_page_structure(messages, page_info["image_path"])
+                    last_result = result
                     stats["parser_api_calls"] += 1
                     stats["total_parser_calls"] += 1
                     raw_name = raw_dir / f"page_{page:03d}_pass_{pass_index:03d}.raw.json"
@@ -798,17 +1164,35 @@ def _parse_paper(
                     break
                 except Exception as exc:
                     last_exc = exc
-                    if attempt >= retry_on_json_failure:
+                    if _raw_response_finish_reason(last_result) == "length" or attempt >= retry_on_json_failure:
                         break
             if raw_obj is None:
                 failure_reason = str(last_exc) if last_exc else "parser returned no parseable JSON"
-                stats["parser_json_failures"] += 1
-                append_jsonl(paths["errors"], {"paper_id": paper_id, "page": page, "pass_index": pass_index, "type": "parser_page_failure", "error": failure_reason})
-                max_failures = int(stats.get("max_parser_json_failures") or 0)
-                if max_failures > 0 and stats["parser_json_failures"] >= max_failures:
-                    append_jsonl(paths["errors"], {"paper_id": paper_id, "page": page, "type": "parser_json_failure_threshold_reached", "max_parser_json_failures": max_failures, "parser_json_failures": stats["parser_json_failures"]})
-                    _write_report_from_paths(paths, stats)
-                    raise RuntimeError(f"Parser JSON/page failure threshold reached: {stats['parser_json_failures']} >= {max_failures}")
+                finish_reason = _raw_response_finish_reason(last_result)
+                error_type = "parser_page_failure"
+                if finish_reason == "length":
+                    error_type = "parser_truncated_json_failure"
+                    stats["parser_truncated_json_failures"] = int(stats.get("parser_truncated_json_failures", 0)) + 1
+                    failure_reason = f"{failure_reason}; parser response truncated by max_tokens"
+                else:
+                    stats["parser_json_failures"] += 1
+                append_jsonl(
+                    paths["errors"],
+                    {
+                        "paper_id": paper_id,
+                        "page": page,
+                        "pass_index": pass_index,
+                        "type": error_type,
+                        "finish_reason": finish_reason,
+                        "error": failure_reason,
+                    },
+                )
+                if finish_reason != "length":
+                    max_failures = int(stats.get("max_parser_json_failures") or 0)
+                    if max_failures > 0 and stats["parser_json_failures"] >= max_failures:
+                        append_jsonl(paths["errors"], {"paper_id": paper_id, "page": page, "type": "parser_json_failure_threshold_reached", "max_parser_json_failures": max_failures, "parser_json_failures": stats["parser_json_failures"]})
+                        _write_report_from_paths(paths, stats)
+                        raise RuntimeError(f"Parser JSON/page failure threshold reached: {stats['parser_json_failures']} >= {max_failures}")
                 break
             repaired = validate_page_structure(raw_obj, paper_id, page, parser_mode)
             start_index = len(page_records) + 1
@@ -988,6 +1372,20 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- page_routing_enabled: {stats.get('page_routing_enabled')}",
         f"- page_routing_source: `{stats.get('page_routing_source')}`",
         f"- page_routing_method: `{stats.get('page_routing_method')}`",
+        f"- page_ranking_bonus_enabled: {stats.get('page_ranking_bonus_enabled')}",
+        f"- page_routing_task_family_strategy: {stats.get('page_routing_task_family_strategy')}",
+        f"- page_routing_single_strategy: `{stats.get('page_routing_single_strategy')}`",
+        f"- page_routing_multi_strategy: `{stats.get('page_routing_multi_strategy')}`",
+        f"- page_routing_single_top1_min_pages: {stats.get('page_routing_single_top1_min_pages')}",
+        f"- page_routing_strategy_usage: `{stats.get('page_routing_strategy_usage', {})}`",
+        f"- single_top1_quota_queries: {stats.get('single_top1_quota_queries', 0)}",
+        f"- single_top1_quota_added_pages: {stats.get('single_top1_quota_added_pages', 0)}",
+        f"- single_top1_quota_replaced_pages: {stats.get('single_top1_quota_replaced_pages', 0)}",
+        f"- multi_candidate_primary_quota_queries: {stats.get('multi_candidate_primary_quota_queries', 0)}",
+        f"- multi_candidate_primary_quota_added_pages: {stats.get('multi_candidate_primary_quota_added_pages', 0)}",
+        f"- multi_candidate_primary_quota_covered_candidates: {stats.get('multi_candidate_primary_quota_covered_candidates', 0)}",
+        f"- selected_pages_from_top1_candidate_count: {stats.get('selected_pages_from_top1_candidate_count', 0)}",
+        f"- selected_pages_from_non_top1_candidates_count: {stats.get('selected_pages_from_non_top1_candidates_count', 0)}",
         f"- page_routing_top_pages_per_candidate: {stats.get('page_routing_top_pages_per_candidate', 0)}",
         f"- effective_page_routing_top_pages_per_candidate_distribution: `{stats.get('effective_page_routing_top_pages_per_candidate_distribution', {})}`",
         f"- page_routing_top_pages_global_override: {stats.get('page_routing_top_pages_global_override', 0)}",
@@ -1034,6 +1432,10 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- parser extraction mode: `{stats.get('parser_extraction_mode')}`",
         f"- symbolic artifact version: `{stats.get('symbolic_artifact_version')}`",
         f"- structured cache policy: `{stats.get('structured_cache_policy')}`",
+        f"- symbolic_cache_root_override_enabled: {stats.get('symbolic_cache_root_override_enabled')}",
+        f"- symbolic_cache_root_requested: `{stats.get('symbolic_cache_root_requested', '')}`",
+        f"- symbolic_cache_structured_root: `{stats.get('symbolic_cache_structured_root', '')}`",
+        f"- symbolic_cache_records_standardized: {stats.get('symbolic_cache_records_standardized', 0)}",
         f"- parser max tokens: {stats.get('parser_max_tokens')}",
         f"- max records per call: {stats.get('parser_max_records_per_call')}",
         f"- max continuations per page: {stats.get('parser_max_continuations_per_page')}",
@@ -1047,6 +1449,7 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- newly parsed papers: {stats.get('newly_parsed_papers', 0)}",
         f"- failed parsed papers: {stats.get('failed_parsed_papers', 0)}",
         f"- parser JSON/page failures: {stats.get('parser_json_failures', 0)}",
+        f"- parser truncated JSON/page failures: {stats.get('parser_truncated_json_failures', 0)}",
         f"- skipped pages: {stats.get('skipped_pages', 0)}",
         f"- parser API calls saved by freeze mechanism: {stats.get('parser_api_calls_saved', 0)}",
         f"- complete pages: {stats.get('complete_pages', 0)}",
@@ -1072,6 +1475,7 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- rejected symbolic records 数: {stats.get('rejected_symbolic_records', 0)}",
         "- symbolic selection method: `symbolic_lexical_bm25_without_embedding`",
         f"- answer model: `{stats.get('answer_model')}`",
+        f"- metadata-only retrieval eval model: `{stats.get('metadata_only_retrieval_eval_model')}`",
         f"- answer model image input capability: {stats.get('answer_supports_images')}",
         f"- metadata-only eval freeze: {stats.get('metadata_only_eval_freeze')}",
         f"- metadata-only eval freeze mode: `{stats.get('metadata_only_eval_freeze_mode')}`",
@@ -1080,6 +1484,11 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- vlm2 metadata no-valid-selection count: {stats.get('vlm2_metadata_no_valid_selection_count', 0)}",
         f"- vlm2_context_mode: `{stats.get('vlm2_context_mode')}`",
         f"- vlm2_effective_context_mode: `{stats.get('vlm2_effective_context_mode')}`",
+        f"- vlm2_context_selection_mode: `{stats.get('vlm2_context_selection_mode')}`",
+        f"- vlm2_max_context_records: {stats.get('vlm2_max_context_records', 0)}",
+        f"- vlm2_max_context_chars: {stats.get('vlm2_max_context_chars', 0)}",
+        f"- vlm2_context_truncated_count: {stats.get('vlm2_context_truncated_count', 0)}",
+        f"- average_vlm2_selected_records_per_query: {stats.get('average_vlm2_selected_records_per_query', 0)}",
         f"- vlm2_context_mode_downgraded: {stats.get('vlm2_context_mode_downgraded')}",
         f"- vlm2_context_mode_downgrade_reason: `{stats.get('vlm2_context_mode_downgrade_reason')}`",
         f"- vlm2_prompt_context_fields: `{stats.get('vlm2_prompt_context_fields')}`",
@@ -1103,6 +1512,12 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         f"- supporting_evidence_selected_count: {stats.get('supporting_evidence_selected_count', 0)}",
         f"- grounding_label_hints_enabled: {stats.get('grounding_label_hints_enabled')}",
         f"- grounding_label_hints_by_type: `{stats.get('grounding_label_hints_by_type', {})}`",
+        f"- symbolic_evidence_standardization: {stats.get('symbolic_evidence_standardization')}",
+        f"- symbolic_evidence_locator_standardized_count: {stats.get('symbolic_evidence_locator_standardized_count', 0)}",
+        f"- symbolic_evidence_empty_filled_count: {stats.get('symbolic_evidence_empty_filled_count', 0)}",
+        f"- symbolic_evidence_non_object_replaced_count: {stats.get('symbolic_evidence_non_object_replaced_count', 0)}",
+        f"- symbolic_evidence_standardization_no_match_count: {stats.get('symbolic_evidence_standardization_no_match_count', 0)}",
+        f"- symbolic_evidence_standardization_no_locator_count: {stats.get('symbolic_evidence_standardization_no_locator_count', 0)}",
         f"- invented_grounding_labels_removed_count: {stats.get('invented_grounding_labels_removed_count', 0)}",
         f"- locator_validation_errors_count: {stats.get('locator_validation_errors_count', 0)}",
         f"- answer API calls: {stats.get('answer_api_calls', 0)}",
@@ -1180,8 +1595,8 @@ def _write_report(path: Path, stats: dict[str, Any]) -> None:
         "- Page routing is global across all top-k candidate PDFs for each query.",
         "- Global page ranking uses native PyMuPDF text extraction only.",
         "- No VLM-generated summaries, inventories, or key terms are used for page ranking.",
-        "- The system does not enforce a per-paper selected page quota.",
-        "- A paper may contribute zero, one, or many selected pages depending on global page scores.",
+        "- For multi-paper routing, the configured strategy may reserve one primary-evidence page per candidate before global-rank filling.",
+        "- For single-paper routing, the configured strategy may prioritize the top-ranked candidate paper.",
         "- VLM-1 is called only on selected pages unless fallback mode is triggered.",
         "- VLM-2 still receives only selected symbolic evidence and precomputed crop images when enabled, never full page images.",
     ]
@@ -1204,7 +1619,12 @@ def main() -> int:
     paths = _paths(output_dir, args.resume, args.dry_run, args.skip_generation)
     processed_root = Path(args.processed_output_dir)
     slug = model_slug(config.parser_model)
-    structured_root = processed_root / slug
+    symbolic_cache_root_value = args.symbolic_cache_root if args.symbolic_cache_root is not None else config.symbolic_cache_root
+    structured_root, symbolic_cache_root_override_enabled, symbolic_cache_root_requested = _resolve_structured_root(
+        processed_root,
+        slug,
+        symbolic_cache_root_value,
+    )
     if args.clear_structured_cache and structured_root.exists():
         shutil.rmtree(structured_root)
     render_dpi = args.render_dpi or config.render_dpi
@@ -1242,6 +1662,7 @@ def main() -> int:
     metadata_by_id = {str(r.get("paper_id")): r for r in metadata}
     parser = VLMParserClient(config)
     answer_client = VLMAnswerClient(config)
+    metadata_selection_client = VLMAnswerClient(replace(config, answer_model=config.metadata_only_retrieval_eval_model))
     stats: dict[str, Any] = {
         "processed_queries": 0,
         "run_status": "running",
@@ -1273,6 +1694,20 @@ def main() -> int:
         "page_routing_enabled": page_routing_enabled,
         "page_routing_source": config.page_routing_source,
         "page_routing_method": config.page_routing_method,
+        "page_ranking_bonus_enabled": config.page_ranking_bonus_enabled,
+        "page_routing_task_family_strategy": config.page_routing_task_family_strategy,
+        "page_routing_single_strategy": config.page_routing_single_strategy,
+        "page_routing_multi_strategy": config.page_routing_multi_strategy,
+        "page_routing_single_top1_min_pages": config.page_routing_single_top1_min_pages,
+        "page_routing_strategy_usage": {},
+        "single_top1_quota_queries": 0,
+        "single_top1_quota_added_pages": 0,
+        "single_top1_quota_replaced_pages": 0,
+        "multi_candidate_primary_quota_queries": 0,
+        "multi_candidate_primary_quota_added_pages": 0,
+        "multi_candidate_primary_quota_covered_candidates": 0,
+        "selected_pages_from_top1_candidate_count": 0,
+        "selected_pages_from_non_top1_candidates_count": 0,
         "page_routing_top_pages_per_candidate": config.page_routing_top_pages_per_candidate,
         "page_routing_top_pages_global_override": explicit_top_pages_global,
         "total_candidate_pages_before_routing": 0,
@@ -1316,6 +1751,10 @@ def main() -> int:
         "parser_extraction_mode": config.parser_extraction_mode,
         "symbolic_artifact_version": config.symbolic_artifact_version,
         "structured_cache_policy": cache_policy,
+        "symbolic_cache_root_override_enabled": symbolic_cache_root_override_enabled,
+        "symbolic_cache_root_requested": symbolic_cache_root_requested,
+        "symbolic_cache_structured_root": str(structured_root),
+        "symbolic_cache_records_standardized": 0,
         "parser_max_tokens": config.parser_max_tokens,
         "parser_max_records_per_call": config.parser_max_records_per_call,
         "parser_max_continuations_per_page": config.parser_max_continuations_per_page,
@@ -1328,6 +1767,7 @@ def main() -> int:
         "newly_parsed_papers": 0,
         "failed_parsed_papers": 0,
         "parser_json_failures": 0,
+        "parser_truncated_json_failures": 0,
         "max_parser_json_failures": args.max_parser_json_failures,
         "skipped_pages": 0,
         "parser_api_calls_saved": 0,
@@ -1354,6 +1794,7 @@ def main() -> int:
         "papers_failed": 0,
         "partial_artifacts_used_in_answer_generation": 0,
         "answer_model": config.answer_model,
+        "metadata_only_retrieval_eval_model": config.metadata_only_retrieval_eval_model,
         "answer_supports_images": answer_client.supports_image_input(),
         "metadata_only_eval_freeze": args.metadata_only_eval_freeze,
         "metadata_only_eval_freeze_mode": "vlm2_metadata_paper_selection" if args.metadata_only_eval_freeze else "",
@@ -1362,6 +1803,11 @@ def main() -> int:
         "vlm2_metadata_no_valid_selection_count": 0,
         "vlm2_context_mode": requested_vlm2_context_mode,
         "vlm2_effective_context_mode": _effective_vlm2_context_mode(requested_vlm2_context_mode, answer_client.supports_image_input(), {}),
+        "vlm2_context_selection_mode": config.vlm2_context_selection_mode,
+        "vlm2_max_context_records": config.vlm2_max_context_records,
+        "vlm2_max_context_chars": config.vlm2_max_context_chars,
+        "vlm2_context_truncated_count": 0,
+        "average_vlm2_selected_records_per_query": 0,
         "vlm2_context_mode_downgraded": False,
         "vlm2_context_mode_downgrade_reason": "",
         "vlm2_include_parse_confidence": include_parse_confidence,
@@ -1388,6 +1834,12 @@ def main() -> int:
         "supporting_evidence_selected_count": 0,
         "grounding_label_hints_enabled": True,
         "grounding_label_hints_by_type": {},
+        "symbolic_evidence_standardization": config.symbolic_evidence_standardization,
+        "symbolic_evidence_locator_standardized_count": 0,
+        "symbolic_evidence_empty_filled_count": 0,
+        "symbolic_evidence_non_object_replaced_count": 0,
+        "symbolic_evidence_standardization_no_match_count": 0,
+        "symbolic_evidence_standardization_no_locator_count": 0,
         "invented_grounding_labels_removed_count": 0,
         "locator_validation_errors_count": 0,
         "answer_api_calls": 0,
@@ -1471,7 +1923,7 @@ def main() -> int:
                 prediction = _metadata_only_vlm_prediction(
                     sample,
                     metadata_selection_candidates,
-                    answer_client,
+                    metadata_selection_client,
                     paths,
                     stats,
                     metadata_selection_policy,
@@ -1560,12 +2012,33 @@ def main() -> int:
                     query_max_pages_global,
                     fallback_on_empty_text=config.page_routing_fallback_on_empty_text,
                     empty_text_parse_first_n_pages=config.page_routing_empty_text_global_parse_first_n_pages,
+                    page_ranking_bonus_enabled=config.page_ranking_bonus_enabled,
+                    task_family_strategy_enabled=config.page_routing_task_family_strategy,
+                    single_strategy=config.page_routing_single_strategy,
+                    multi_strategy=config.page_routing_multi_strategy,
+                    single_top1_min_pages=config.page_routing_single_top1_min_pages,
                 )
                 stats["total_candidate_pages_before_routing"] += int(routing_result.get("total_candidate_pages") or 0)
+                _increment_counter_stat(stats, "page_routing_strategy_usage", routing_result.get("page_routing_strategy") or "unknown")
+                stats["single_top1_quota_added_pages"] += int(routing_result.get("top1_quota_added_pages") or 0)
+                stats["single_top1_quota_replaced_pages"] += int(routing_result.get("top1_quota_replaced_pages") or 0)
+                if str(routing_result.get("page_routing_strategy") or "") == "top1_candidate_quota":
+                    stats["single_top1_quota_queries"] += 1
+                if routing_result.get("multi_candidate_primary_quota_enabled"):
+                    stats["multi_candidate_primary_quota_queries"] += 1
+                    stats["multi_candidate_primary_quota_added_pages"] += int(routing_result.get("multi_candidate_primary_quota_added_pages") or 0)
+                    stats["multi_candidate_primary_quota_covered_candidates"] += int(routing_result.get("multi_candidate_primary_quota_covered_count") or 0)
                 if routing_result.get("fallback_reason") == "all_native_text_empty_global_fallback":
                     stats["empty_text_global_fallback_used_count"] += 1
                 append_jsonl(paths["global_page_ranking"], routing_result)
                 initial_pages = list(routing_result.get("selected_pages_initial") or [])
+                top1_id_for_routing = str(routing_result.get("top1_candidate_paper_id") or "")
+                stats["selected_pages_from_top1_candidate_count"] += sum(
+                    1 for item in initial_pages if top1_id_for_routing and str(item.get("paper_id") or "") == top1_id_for_routing
+                )
+                stats["selected_pages_from_non_top1_candidates_count"] += sum(
+                    1 for item in initial_pages if not top1_id_for_routing or str(item.get("paper_id") or "") != top1_id_for_routing
+                )
                 parsed_global_pages = list(initial_pages)
                 stats["top_p_pages_selected_total"] += len(initial_pages)
                 stats["vlm1_pages_selected_after_global_routing"] += len(initial_pages)
@@ -1642,6 +2115,9 @@ def main() -> int:
                 support_text_min=config.vlm2_support_text_min,
                 context_types_enabled=config.vlm2_context_types_enabled,
                 context_type_budget_per_type=config.vlm2_context_type_budget_per_type,
+                context_selection_mode=config.vlm2_context_selection_mode,
+                max_context_records=config.vlm2_max_context_records,
+                max_context_chars=config.vlm2_max_context_chars,
             )
             if page_routing_enabled and routing_result is not None and config.page_routing_enable_progressive_expansion:
                 ranked_pages = list(routing_result.get("ranked_pages") or [])
@@ -1726,6 +2202,9 @@ def main() -> int:
                         support_text_min=config.vlm2_support_text_min,
                         context_types_enabled=config.vlm2_context_types_enabled,
                         context_type_budget_per_type=config.vlm2_context_type_budget_per_type,
+                        context_selection_mode=config.vlm2_context_selection_mode,
+                        max_context_records=config.vlm2_max_context_records,
+                        max_context_chars=config.vlm2_max_context_chars,
                     )
             if page_routing_enabled and routing_result is not None:
                 total_pages = int(routing_result.get("total_candidate_pages") or 0)
@@ -1736,6 +2215,17 @@ def main() -> int:
                     "task_family_bucket": budget["task_family_bucket"],
                     "top_k_papers": effective_top_k,
                     "page_routing_top_pages_per_candidate": effective_pages_per_candidate,
+                    "page_routing_strategy": routing_result.get("page_routing_strategy"),
+                    "top1_candidate_paper_id": routing_result.get("top1_candidate_paper_id"),
+                    "top1_min_pages_required": routing_result.get("top1_min_pages_required"),
+                    "top1_pages_in_global_top_p_before_quota": routing_result.get("top1_pages_in_global_top_p_before_quota"),
+                    "top1_pages_selected_after_quota": routing_result.get("top1_pages_selected_after_quota"),
+                    "top1_quota_added_pages": routing_result.get("top1_quota_added_pages"),
+                    "top1_quota_replaced_pages": routing_result.get("top1_quota_replaced_pages"),
+                    "multi_candidate_primary_quota_enabled": routing_result.get("multi_candidate_primary_quota_enabled"),
+                    "multi_candidate_primary_quota_candidate_count": routing_result.get("multi_candidate_primary_quota_candidate_count"),
+                    "multi_candidate_primary_quota_covered_count": routing_result.get("multi_candidate_primary_quota_covered_count"),
+                    "multi_candidate_primary_quota_added_pages": routing_result.get("multi_candidate_primary_quota_added_pages"),
                     "total_candidate_pages": total_pages,
                     "initial_top_p_global": query_top_pages_global,
                     "max_pages_global": query_max_pages_global,
@@ -1761,6 +2251,9 @@ def main() -> int:
                 "primary_evidence_type_count": selected.get("primary_evidence_type_count", 0),
                 "supporting_evidence_count": selected.get("supporting_evidence_count", 0),
                 "grounding_label_hints_by_type": selected.get("grounding_label_hints_by_type", {}),
+                "context_selection_mode": selected.get("context_selection_mode"),
+                "context_truncated": selected.get("context_truncated", False),
+                "selected_record_count": selected.get("selected_record_count", 0),
                 "selected_records": selected.get("selected_records_debug", []),
                 "selected_visual_records": selected.get("selected_visual_records", []),
             }
@@ -1773,6 +2266,9 @@ def main() -> int:
                 "primary_evidence_type_count": selected.get("primary_evidence_type_count", 0),
                 "supporting_evidence_count": selected.get("supporting_evidence_count", 0),
                 "grounding_label_hints_by_type": selected.get("grounding_label_hints_by_type", {}),
+                "context_selection_mode": selected.get("context_selection_mode"),
+                "context_truncated": selected.get("context_truncated", False),
+                "selected_record_count": selected.get("selected_record_count", 0),
             }
             if selected_prompt["selected_evidence"]:
                 stats["vlm2_prompt_context_fields"] = sorted(
@@ -1813,6 +2309,7 @@ def main() -> int:
                     [str(c.get("paper_id")) for c in candidates],
                     answer_contract=answer_contract,
                     selected_evidence=selected_prompt.get("selected_evidence", []),
+                    symbolic_evidence_standardization=config.symbolic_evidence_standardization,
                 )
                 _update_normalization_error_stats(errors, stats)
                 for error in errors:
@@ -1841,7 +2338,7 @@ def main() -> int:
         exit_code = 1
     finally:
         _write_report_from_paths(paths, stats)
-        if args.sync_processed_run_store and not args.metadata_only_eval_freeze:
+        if args.sync_processed_run_store and not args.metadata_only_eval_freeze and not symbolic_cache_root_override_enabled:
             try:
                 processed_run_root = Path(args.processed_output_dir).parent / "vlm_symbolic_runs"
                 manifest = sync_symbolic_run_to_processed(

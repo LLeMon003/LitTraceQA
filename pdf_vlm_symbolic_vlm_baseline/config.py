@@ -33,24 +33,36 @@ class PipelineConfig:
     parser_allow_region_split: bool
     parser_region_split_on_repeated_failure: bool
     symbolic_artifact_version: str
+    symbolic_cache_root: str
     answer_provider: str
     answer_api_key: str | None
     answer_base_url: str
     answer_model: str
+    metadata_only_retrieval_eval_model: str
     answer_temperature: float
     answer_max_tokens: int
     answer_timeout_seconds: float
+    generation_retry_on_429: bool
+    generation_429_max_retries: int
+    generation_429_initial_backoff_seconds: float
+    generation_429_backoff_multiplier: float
+    generation_429_max_backoff_seconds: float
+    generation_cooldown_after_429_seconds: float
     render_dpi: int
     render_format: str
     render_max_pages_per_paper: int
     structured_cache_policy: str
     vlm2_context_mode: str
+    vlm2_context_selection_mode: str
+    vlm2_max_context_records: int
+    vlm2_max_context_chars: int
     vlm2_include_parse_confidence: bool
     vlm2_evidence_total_budget: int
     vlm2_primary_evidence_min: int
     vlm2_support_text_min: int
     vlm2_context_types_enabled: bool
     vlm2_context_type_budget_per_type: int
+    symbolic_evidence_standardization: bool
     retrieval_method: str
     retrieval_enable_topic_expansion: bool
     retrieval_enable_query_decomposition: bool
@@ -64,6 +76,11 @@ class PipelineConfig:
     page_routing_enabled: bool
     page_routing_source: str
     page_routing_method: str
+    page_ranking_bonus_enabled: bool
+    page_routing_task_family_strategy: bool
+    page_routing_single_strategy: str
+    page_routing_multi_strategy: str
+    page_routing_single_top1_min_pages: int
     page_routing_top_pages_per_candidate: int
     page_routing_top_pages_global: int
     page_routing_max_pages_global: int
@@ -134,24 +151,36 @@ def load_pipeline_config(env_path: str | Path = ".env") -> PipelineConfig:
         parser_allow_region_split=get_bool("PARSER_ALLOW_REGION_SPLIT", False),
         parser_region_split_on_repeated_failure=get_bool("PARSER_REGION_SPLIT_ON_REPEATED_FAILURE", False),
         symbolic_artifact_version=get("SYMBOLIC_ARTIFACT_VERSION", DEFAULT_ARTIFACT_VERSION) or DEFAULT_ARTIFACT_VERSION,
+        symbolic_cache_root=get("SYMBOLIC_CACHE_ROOT", ""),
         answer_provider=get("ANSWER_PROVIDER", "siliconflow"),
         answer_api_key=answer_key,
         answer_base_url=answer_base,
         answer_model=get("ANSWER_MODEL", DEFAULT_VLM_MODEL) or DEFAULT_VLM_MODEL,
+        metadata_only_retrieval_eval_model=get("METADATA_ONLY_RETRIEVAL_EVAL_MODEL", "") or get("ANSWER_MODEL", DEFAULT_VLM_MODEL) or DEFAULT_VLM_MODEL,
         answer_temperature=float(get("ANSWER_TEMPERATURE", "0") or "0"),
         answer_max_tokens=int(get("ANSWER_MAX_TOKENS", "4096") or "4096"),
         answer_timeout_seconds=float(get("ANSWER_TIMEOUT_SECONDS", "180") or "180"),
+        generation_retry_on_429=get_bool("GENERATION_RETRY_ON_429", True),
+        generation_429_max_retries=int(get("GENERATION_429_MAX_RETRIES", "6") or "6"),
+        generation_429_initial_backoff_seconds=float(get("GENERATION_429_INITIAL_BACKOFF_SECONDS", "20") or "20"),
+        generation_429_backoff_multiplier=float(get("GENERATION_429_BACKOFF_MULTIPLIER", "2") or "2"),
+        generation_429_max_backoff_seconds=float(get("GENERATION_429_MAX_BACKOFF_SECONDS", "300") or "300"),
+        generation_cooldown_after_429_seconds=float(get("GENERATION_COOLDOWN_AFTER_429_SECONDS", "120") or "120"),
         render_dpi=int(get("PDF_RENDER_DPI", "160") or "160"),
         render_format=(get("PDF_RENDER_FORMAT", "jpg") or "jpg").lower(),
         render_max_pages_per_paper=int(get("PDF_RENDER_MAX_PAGES_PER_PAPER", "0") or "0"),
         structured_cache_policy=get("STRUCTURED_CACHE_POLICY", "reuse_complete_only") or "reuse_complete_only",
         vlm2_context_mode=get("VLM2_CONTEXT_MODE", "text_only") or "text_only",
+        vlm2_context_selection_mode=get("VLM2_CONTEXT_SELECTION_MODE", "page_all_symbolic") or "page_all_symbolic",
+        vlm2_max_context_records=int(get("VLM2_MAX_CONTEXT_RECORDS", "0") or "0"),
+        vlm2_max_context_chars=int(get("VLM2_MAX_CONTEXT_CHARS", "0") or "0"),
         vlm2_include_parse_confidence=get_bool("VLM2_INCLUDE_PARSE_CONFIDENCE", True),
         vlm2_evidence_total_budget=int(get("VLM2_EVIDENCE_TOTAL_BUDGET", "24") or "24"),
         vlm2_primary_evidence_min=int(get("VLM2_PRIMARY_EVIDENCE_MIN", "6") or "6"),
         vlm2_support_text_min=int(get("VLM2_SUPPORT_TEXT_MIN", "4") or "4"),
         vlm2_context_types_enabled=get_bool("VLM2_CONTEXT_TYPES_ENABLED", True),
         vlm2_context_type_budget_per_type=int(get("VLM2_CONTEXT_TYPE_BUDGET_PER_TYPE", "3") or "3"),
+        symbolic_evidence_standardization=get_bool("SYMBOLIC_EVIDENCE_STANDARDIZATION", True),
         retrieval_method=get("RETRIEVAL_METHOD", "hybrid_alias") or "hybrid_alias",
         retrieval_enable_topic_expansion=get_bool("RETRIEVAL_ENABLE_TOPIC_EXPANSION", False),
         retrieval_enable_query_decomposition=get_bool("RETRIEVAL_ENABLE_QUERY_DECOMPOSITION", True),
@@ -165,6 +194,11 @@ def load_pipeline_config(env_path: str | Path = ".env") -> PipelineConfig:
         page_routing_enabled=get_bool("PAGE_ROUTING_ENABLED", True),
         page_routing_source=get("PAGE_ROUTING_SOURCE", "native_text") or "native_text",
         page_routing_method=get("PAGE_ROUTING_METHOD", "global_native_text_bm25_rules") or "global_native_text_bm25_rules",
+        page_ranking_bonus_enabled=get_bool("PAGE_RANKING_BONUS_ENABLED", True),
+        page_routing_task_family_strategy=get_bool("PAGE_ROUTING_TASK_FAMILY_STRATEGY", True),
+        page_routing_single_strategy=get("PAGE_ROUTING_SINGLE_STRATEGY", "top1_candidate_quota") or "top1_candidate_quota",
+        page_routing_multi_strategy=get("PAGE_ROUTING_MULTI_STRATEGY", "global_ranked_pages") or "global_ranked_pages",
+        page_routing_single_top1_min_pages=int(get("PAGE_ROUTING_SINGLE_TOP1_MIN_PAGES", "0") or "0"),
         page_routing_top_pages_per_candidate=int(get("PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE", "2") or "2"),
         page_routing_top_pages_global=int(top_pages_global_value) if top_pages_global_value else 0,
         page_routing_max_pages_global=int(get("PAGE_ROUTING_MAX_PAGES_GLOBAL", "16") or "16"),
