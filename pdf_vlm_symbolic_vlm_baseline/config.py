@@ -63,6 +63,7 @@ class PipelineConfig:
     vlm2_context_types_enabled: bool
     vlm2_context_type_budget_per_type: int
     symbolic_evidence_standardization: bool
+    symbolic_source_type_hints: bool
     retrieval_method: str
     retrieval_enable_topic_expansion: bool
     retrieval_enable_query_decomposition: bool
@@ -81,6 +82,11 @@ class PipelineConfig:
     page_routing_single_strategy: str
     page_routing_multi_strategy: str
     page_routing_single_top1_min_pages: int
+    page_ranking_structural_evidence_weight: float
+    page_ranking_multi_text_span_hybrid_enabled: bool
+    page_ranking_multi_text_span_hybrid_alpha: float
+    page_ranking_multi_text_span_hybrid_gamma: float
+    page_ranking_multi_text_span_hybrid_chunk_max_chars: int
     page_routing_top_pages_per_candidate: int
     page_routing_top_pages_global: int
     page_routing_max_pages_global: int
@@ -181,6 +187,7 @@ def load_pipeline_config(env_path: str | Path = ".env") -> PipelineConfig:
         vlm2_context_types_enabled=get_bool("VLM2_CONTEXT_TYPES_ENABLED", True),
         vlm2_context_type_budget_per_type=int(get("VLM2_CONTEXT_TYPE_BUDGET_PER_TYPE", "3") or "3"),
         symbolic_evidence_standardization=get_bool("SYMBOLIC_EVIDENCE_STANDARDIZATION", True),
+        symbolic_source_type_hints=get_bool("SYMBOLIC_SOURCE_TYPE_HINTS", False),
         retrieval_method=get("RETRIEVAL_METHOD", "hybrid_alias") or "hybrid_alias",
         retrieval_enable_topic_expansion=get_bool("RETRIEVAL_ENABLE_TOPIC_EXPANSION", False),
         retrieval_enable_query_decomposition=get_bool("RETRIEVAL_ENABLE_QUERY_DECOMPOSITION", True),
@@ -199,6 +206,11 @@ def load_pipeline_config(env_path: str | Path = ".env") -> PipelineConfig:
         page_routing_single_strategy=get("PAGE_ROUTING_SINGLE_STRATEGY", "top1_candidate_quota") or "top1_candidate_quota",
         page_routing_multi_strategy=get("PAGE_ROUTING_MULTI_STRATEGY", "global_ranked_pages") or "global_ranked_pages",
         page_routing_single_top1_min_pages=int(get("PAGE_ROUTING_SINGLE_TOP1_MIN_PAGES", "0") or "0"),
+        page_ranking_structural_evidence_weight=float(get("PAGE_RANKING_STRUCTURAL_EVIDENCE_WEIGHT", "0") or "0"),
+        page_ranking_multi_text_span_hybrid_enabled=get_bool("PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_ENABLED", True),
+        page_ranking_multi_text_span_hybrid_alpha=float(get("PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_ALPHA", "0.75") or "0.75"),
+        page_ranking_multi_text_span_hybrid_gamma=float(get("PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_GAMMA", "4") or "4"),
+        page_ranking_multi_text_span_hybrid_chunk_max_chars=int(get("PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_CHUNK_MAX_CHARS", "700") or "700"),
         page_routing_top_pages_per_candidate=int(get("PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE", "2") or "2"),
         page_routing_top_pages_global=int(top_pages_global_value) if top_pages_global_value else 0,
         page_routing_max_pages_global=int(get("PAGE_ROUTING_MAX_PAGES_GLOBAL", "16") or "16"),

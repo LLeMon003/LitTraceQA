@@ -10,7 +10,7 @@
 | ------- | ------------------------------------------------ | -------: | -------------: | -------------------------------------------- |
 | Log 001 | PDF-Free Baseline：`metadata_only_title_abstract` |      已实现 |              否 | 只用 title + abstract 完成候选检索与 LLM 回答           |
 | Log 002 | PDF OCR Context VLM Baseline：`pdf_ocr_context_vlm` |   Smoke 已接通 |       读取本地 PDF | 用 DeepSeek-OCR 生成结构化 OCR contexts，再交给 VLM 回答 |
-| Log 003 | PDF VLM Symbolic VLM Baseline：`pdf_vlm_symbolic_vlm` | v5 task-family budget ready | 读取本地 PDF | task-family budget + native-text global page routing + VLM-1 symbolic records + VLM-2 回答 |
+| Log 003 | PDF VLM Symbolic VLM Baseline：`pdf_vlm_symbolic_vlm` | v5 hybrid page routing ready | 读取本地 PDF | task-family budget + multi-paper hybrid span page routing + VLM-1 symbolic records + VLM-2 回答 |
 
 ## 仓库当前结构
 
@@ -1039,10 +1039,10 @@ OCR response looked like a prompt/schema echo, not page transcription.
 
 # Log 003｜PDF VLM Symbolic VLM Baseline：pdf_vlm_symbolic_vlm
 
-## 当前代码版本快照｜v5 task-family budget
+## 当前代码版本快照｜v5 hybrid page routing
 
-当前 `pdf_vlm_symbolic_vlm_baseline` 已从固定 `top_k=5 / top_p=25` 策略，更新为按官方 `task_family` 分配 retrieval 和 page-routing budget。
-同时，当前更新了当下逻辑的数据结构链，在Expected_examples中
+当前 `pdf_vlm_symbolic_vlm_baseline` 已从固定 `top_k=5 / top_p=25` 策略，更新为按官方 `task_family` 分配 retrieval 和 page-routing budget，并在 multi-paper page ranking 中加入 hybrid text-span page score。该 score 只影响送入 VLM-1 前的 page selection，不进入 VLM prompt，也不作为官方 evidence 提交。
+当前逻辑的数据结构链同步整理在 `Expected_examples/task_family_single_query_data_flow.md`。
 
 当前默认配置：
 
@@ -1052,6 +1052,14 @@ SINGLE_PAPER_TOP_K_PAPERS=5
 SINGLE_PAPER_PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE=5
 MULTI_PAPER_TOP_K_PAPERS=12
 MULTI_PAPER_PAGE_ROUTING_TOP_PAGES_PER_CANDIDATE=3
+PAGE_ROUTING_TASK_FAMILY_STRATEGY=true
+PAGE_ROUTING_SINGLE_STRATEGY=top1_candidate_quota
+PAGE_ROUTING_MULTI_STRATEGY=global_ranked_pages
+PAGE_RANKING_STRUCTURAL_EVIDENCE_WEIGHT=0
+PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_ENABLED=true
+PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_ALPHA=0.75
+PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_GAMMA=4
+PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_CHUNK_MAX_CHARS=700
 SYMBOLIC_ARTIFACT_VERSION=v5_eval_grounded_minimal_symbolic
 VLM2_CONTEXT_MODE=text_only
 VLM2_INCLUDE_PARSE_CONFIDENCE=false
@@ -1071,6 +1079,18 @@ multi_paper
 
 这里的 `top_p` 是 query-level global page ranking 后的页面预算，不是每篇 paper 固定页数。所有候选 PDF 的 native text pages 会进入同一个 query-level page pool，由 `global_native_text_bm25_rules` 排序后选择前 `top_p` 页给 VLM-1。
 
+multi-paper 默认启用 hybrid span score：
+
+```text
+chunk_score = alpha * normalized_BM25(query, chunk)
+            + (1 - alpha) * local_TF-IDF_cosine(query, chunk)
+
+page_span_score = log_mean_exp(chunk_score, gamma)
+final_page_score = page_span_score + normalized_current_policy_page_score
+```
+
+其中 `PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_CHUNK_MAX_CHARS=700` 控制 page native text 切成 paragraph/text chunks 时的最大字符长度。该策略不增加 VLM 调用次数，不增加 page budget，只改变 multi-paper page ranking 的排序。
+
 当前 run report 会额外记录：
 
 ```text
@@ -1081,6 +1101,9 @@ task_family_budget_usage
 effective_top_k_distribution
 effective_top_p_distribution
 effective_page_routing_top_pages_per_candidate_distribution
+page_ranking_multi_text_span_hybrid_enabled
+page_ranking_multi_text_span_hybrid_alpha
+page_ranking_multi_text_span_hybrid_gamma
 ```
 
 当前 VLM 边界仍保持不变：
@@ -1125,6 +1148,7 @@ conda activate littraceqa
 task-family budgeted metadata hybrid retrieval
 → ensure local PDFs
 → native PyMuPDF text scan for query-level global page ranking
+→ multi-paper hybrid span scoring over native text chunks
 → select top-p pages where top_p = effective_pages_per_candidate * effective_top_k
 → render selected PDF pages
 → VLM-1 parse selected page images into symbolic records
@@ -1613,6 +1637,7 @@ official evaluator partial score
 
 ```text
 Expected_examples/task_family_single_query_data_flow.md
+Expected_examples/task_family_multi_paper_data_flow.md
 ```
 
 ## 当前主流程
@@ -1626,6 +1651,7 @@ validation_inputs.jsonl
 -> optional topic-profile expansion only when explicitly enabled
 -> PDF cache / proceedings-first source resolution
 -> native-text global page routing
+-> multi-paper hybrid span page scoring when enabled
 -> selected rendered page images
 -> VLM-1 minimal symbolic parsing
 -> processed_pdfs durable symbolic store
@@ -1635,7 +1661,17 @@ validation_inputs.jsonl
 -> official predictions.jsonl
 ```
 
-VLM-2 不接收 full page image、native PDF、URL、local file path、retrieval score、selector score、bbox、parser confidence 或 internal record id。VLM-2 只接收 selected symbolic evidence 的 answer-facing projection。
+VLM-2 不接收 full page image、native PDF、URL、local file path、retrieval score、page score、selector score、bbox、parser confidence 或 internal record id。VLM-2 只接收 selected symbolic evidence 的 answer-facing projection。
+
+当前 baseline 从 `pdf_vlm_symbolic_vlm_opt_baseline` 移植的有效优化为：
+
+```text
+multi-paper page ranking:
+native-text chunks -> BM25 + local TF-IDF cosine hybrid span score
+hybrid span score + normalized current page policy score -> global page rank
+```
+
+已明确删除/不保留的 opt 实验项包括 evidence-block / neighbor page-only selector、paper-prior alpha、page-score beta、adaptive paper prior 和 multi-paper per-paper cap。
 
 ## 关键数据结构
 

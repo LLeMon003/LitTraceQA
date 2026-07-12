@@ -1,6 +1,6 @@
 # Current Data Flow: `pdf_vlm_symbolic_vlm_baseline`
 
-This document summarizes the current data flow after the v5 symbolic store, VLM-2 answer-contract fixes, and metadata-only paper-selection experiment.
+This document summarizes the current data flow after the v5 symbolic store, VLM-2 answer-contract fixes, metadata-only paper-selection experiment, and multi-paper hybrid span page-ranking update.
 
 ## High-Level Flow
 
@@ -13,6 +13,7 @@ official_dev/data/validation_inputs.jsonl
 -> optional topic-profile expansion for opt-in ablation only
 -> PDF cache and proceedings-first source resolution
 -> native-text page routing
+-> multi-paper hybrid span page scoring when enabled
 -> selected pages rendered as images
 -> VLM-1 minimal symbolic parsing
 -> processed_pdfs durable symbolic store
@@ -21,7 +22,7 @@ official_dev/data/validation_inputs.jsonl
 -> parser normalization and official predictions.jsonl
 ```
 
-VLM-2 does not receive full PDF pages, native PDFs, URLs, local PDF paths, retrieval scores, selector scores, bbox, parser confidence, or internal record ids. If images are ever used by VLM-2, they must be selected evidence crops, not full page images.
+VLM-2 does not receive full PDF pages, native PDFs, URLs, local PDF paths, retrieval scores, page scores, selector scores, bbox, parser confidence, or internal record ids. If images are ever used by VLM-2, they must be selected evidence crops, not full page images.
 
 ## 1. Official Inputs
 
@@ -185,6 +186,7 @@ Native PDF text is used for page routing only:
   "query_id": "q_001",
   "ranking_source": "native_text",
   "ranking_method": "global_native_text_bm25_rules",
+  "page_ranking_multi_text_span_hybrid_enabled": false,
   "total_candidate_pages": 90,
   "selected_pages_initial": [
     {"paper_id": "acl2025_00005", "page": 6, "global_page_rank": 1, "candidate_rank": 1},
@@ -201,6 +203,27 @@ multi-paper default:  top-k papers = 12, average ranked pages per paper = 3
 ```
 
 The top-p page budget is query-global. It is computed from top-k and pages-per-candidate; it is not a strict per-paper quota.
+
+For multi-paper queries, hybrid span page scoring is enabled by default:
+
+```text
+chunk_score = alpha * normalized_BM25(query, chunk)
+            + (1 - alpha) * local_TF-IDF_cosine(query, chunk)
+
+page_span_score = log_mean_exp(chunk_score, gamma)
+final_page_score = page_span_score + normalized_current_policy_page_score
+```
+
+Default controls:
+
+```env
+PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_ENABLED=true
+PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_ALPHA=0.75
+PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_GAMMA=4
+PAGE_RANKING_MULTI_TEXT_SPAN_HYBRID_CHUNK_MAX_CHARS=700
+```
+
+This ranking change does not increase the page budget or the number of VLM calls. Page scores remain audit-only fields and are not exposed to VLM-1 or VLM-2.
 
 ## 4. VLM-1 And Symbolic Store
 

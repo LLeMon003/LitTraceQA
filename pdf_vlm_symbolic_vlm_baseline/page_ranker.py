@@ -4,7 +4,7 @@ import argparse
 import json
 import math
 import re
-from collections import Counter
+from collections import Counter, defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +21,41 @@ EQUATION_RE = re.compile(r"\b(?:Equation|Eq\.|Algorithm|Theorem|loss|objective|a
 CITATION_RE = re.compile(r"\[[0-9,\-\s]+\]|\([A-Z][A-Za-z\-]+(?: et al\.)?,\s*20[0-9]{2}\)|\bReferences\b|\bRelated Work\b", re.IGNORECASE)
 SECTION_RE = re.compile(r"^\s*(?:[0-9]+\.?\s+)?(?:Abstract|Introduction|Method|Approach|Experiment|Results|Ablation|Analysis|Conclusion|References)\b", re.IGNORECASE | re.MULTILINE)
 QUERY_ALIAS_RE = re.compile(r"\b(?:[A-Z]{2,}[A-Za-z0-9.\-]*|[A-Za-z]+(?:-[A-Za-z0-9]+)+|[A-Za-z]*\d+[A-Za-z0-9.\-]*|[A-Za-z]+[A-Z][A-Za-z0-9.\-]*)\b")
+STRUCTURAL_LINE_RE = {
+    "table": re.compile(r"\b(?:table|tab\.)\s*[a-z]*\d*|benchmark|dataset|result|ablation|comparison|method|score", re.IGNORECASE),
+    "figure": re.compile(r"\b(?:figure|fig\.)\s*[a-z]*\d*|panel|plot|diagram|visualization|subfigure", re.IGNORECASE),
+    "equation_algorithm": re.compile(r"\b(?:algorithm|equation|eq\.|loss|objective|theorem|lemma|optimization)\b|[=∑∏∫≤≥]", re.IGNORECASE),
+    "citation_context": re.compile(r"\[[0-9,\-\s]+\]|\breferences?\b|\brelated work\b", re.IGNORECASE),
+    "text_span": re.compile(r"\b(?:implementation|experiment|setup|configuration|hardware|gpu|optimizer|learning rate|training|evaluation|result|analysis)\b", re.IGNORECASE),
+}
+
+STOPWORDS = {
+    "a",
+    "an",
+    "and",
+    "are",
+    "as",
+    "at",
+    "be",
+    "by",
+    "for",
+    "from",
+    "how",
+    "in",
+    "is",
+    "it",
+    "of",
+    "on",
+    "or",
+    "that",
+    "the",
+    "this",
+    "to",
+    "under",
+    "what",
+    "which",
+    "with",
+}
 
 BENCHMARK_TERMS = [
     "CIFAR-10",
@@ -212,6 +247,199 @@ def _query_hint_bonus(sample: dict[str, Any], text: str) -> float:
     return bonus
 
 
+def _extract_structural_text(text: str, source_type: str) -> str:
+    if not text:
+        return ""
+    pattern = STRUCTURAL_LINE_RE.get(source_type) or STRUCTURAL_LINE_RE["text_span"]
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    selected: list[str] = []
+    for index, line in enumerate(lines):
+        if pattern.search(line):
+            selected.append(line)
+            if index + 1 < len(lines) and len(lines[index + 1]) <= 220:
+                selected.append(lines[index + 1].strip())
+    return "\n".join(selected[:12])
+
+
+def _query_content_tokens(sample: dict[str, Any]) -> set[str]:
+    return {
+        token
+        for token in tokenize(str(sample.get("question") or ""))
+        if len(token) > 1 and token not in STOPWORDS
+    }
+
+
+def _structural_evidence_score(sample: dict[str, Any], text: str, primary_type: str) -> float:
+    structural_text = _extract_structural_text(text, primary_type)
+    haystack = structural_text or text[:4000]
+    if not haystack:
+        return 0.0
+    content_tokens = _query_content_tokens(sample)
+    hay_tokens = set(tokenize(haystack))
+    score = len(content_tokens & hay_tokens) / max(1.0, math.sqrt(len(content_tokens) + 1.0))
+
+    hay_lower = haystack.lower()
+    hay_norm = _normalized_hint_text(haystack)
+    alias_hits = 0
+    for alias in _query_hint_terms(sample)["aliases"]:
+        alias_norm = _normalized_hint_text(alias)
+        if alias.lower() in hay_lower or (alias_norm and alias_norm in hay_norm):
+            alias_hits += 1
+    score += min(4.0, alias_hits * 1.25)
+
+    if primary_type == "table":
+        if re.search(r"\b(?:Table|Tab\.)\s*[A-Za-z]*\d+", structural_text, re.IGNORECASE):
+            score += 1.5
+        if re.search(r"\b(?:row|column|benchmark|dataset|method|score|accuracy|F1|AP|FID|NFE)\b", structural_text, re.IGNORECASE):
+            score += 1.0
+        if re.search(r"\b(?:ablation|comparison|results?|performance|outperform)\b", structural_text, re.IGNORECASE):
+            score += 1.0
+    elif primary_type == "figure":
+        if re.search(r"\b(?:Figure|Fig\.)\s*[A-Za-z]*\d+", structural_text, re.IGNORECASE):
+            score += 1.5
+        if re.search(r"\([a-z]\)|\b(?:panel|plot|axis|legend|visual)\b", structural_text, re.IGNORECASE):
+            score += 0.8
+    elif primary_type == "text_span":
+        if re.search(r"\b(?:gpu|rtx|a100|h100|cuda|nvidia|optimizer|learning rate|batch size)\b", haystack, re.IGNORECASE):
+            score += 1.5
+        if re.search(r"\b(?:implementation|experiment|setup|configuration|training details)\b", haystack, re.IGNORECASE):
+            score += 0.8
+    elif primary_type == "equation_algorithm":
+        if re.search(r"\b(?:algorithm|equation|eq\.)\s*[A-Za-z]*\d+|\([0-9]+\)", haystack, re.IGNORECASE):
+            score += 1.5
+    elif primary_type == "citation_context":
+        if re.search(r"\[[0-9,\-\s]+\]", haystack):
+            score += 1.5
+    return score
+
+
+def _normalize_component(values: dict[tuple[str, int], float]) -> dict[tuple[str, int], float]:
+    if not values:
+        return {}
+    low = min(values.values())
+    high = max(values.values())
+    if high <= low:
+        return {key: 0.0 for key in values}
+    return {key: (value - low) / (high - low) for key, value in values.items()}
+
+
+def _normalize_list(values: list[float]) -> list[float]:
+    if not values:
+        return []
+    low = min(values)
+    high = max(values)
+    if high <= low:
+        return [0.0 for _ in values]
+    return [(value - low) / (high - low) for value in values]
+
+
+def _paragraph_chunks(text: str, *, max_chars: int) -> list[str]:
+    paragraphs = [part.strip() for part in re.split(r"\n\s*\n+", text or "") if part.strip()]
+    if len(paragraphs) <= 1:
+        lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+        paragraphs = []
+        current: list[str] = []
+        current_len = 0
+        for line in lines:
+            extra = len(line) + 1
+            if current and current_len + extra > max_chars:
+                paragraphs.append(" ".join(current))
+                current = []
+                current_len = 0
+            current.append(line)
+            current_len += extra
+        if current:
+            paragraphs.append(" ".join(current))
+
+    chunks: list[str] = []
+    for paragraph in paragraphs:
+        words = paragraph.split()
+        current = []
+        current_len = 0
+        for word in words:
+            extra = len(word) + 1
+            if current and current_len + extra > max_chars:
+                chunks.append(" ".join(current))
+                current = []
+                current_len = 0
+            current.append(word)
+            current_len += extra
+        if current:
+            chunks.append(" ".join(current))
+    return [chunk for chunk in chunks if tokenize(chunk)]
+
+
+def _tfidf_cosine_scores(query_tokens: list[str], corpus: list[list[str]]) -> list[float]:
+    if not corpus or not query_tokens:
+        return [0.0 for _ in corpus]
+    docs = corpus + [query_tokens]
+    df: Counter[str] = Counter()
+    for doc in docs:
+        for token in set(doc):
+            df[token] += 1
+    doc_count = len(docs)
+    idf = {token: math.log((doc_count + 1) / (count + 1)) + 1.0 for token, count in df.items()}
+
+    def vector(tokens: list[str]) -> dict[str, float]:
+        counts = Counter(tokens)
+        total = max(1, sum(counts.values()))
+        return {token: (count / total) * idf.get(token, 0.0) for token, count in counts.items()}
+
+    query_vector = vector(query_tokens)
+    query_norm = math.sqrt(sum(value * value for value in query_vector.values()))
+    scores: list[float] = []
+    for doc in corpus:
+        doc_vector = vector(doc)
+        doc_norm = math.sqrt(sum(value * value for value in doc_vector.values()))
+        if query_norm <= 0.0 or doc_norm <= 0.0:
+            scores.append(0.0)
+            continue
+        dot = sum(query_vector.get(token, 0.0) * value for token, value in doc_vector.items())
+        scores.append(dot / (query_norm * doc_norm))
+    return scores
+
+
+def _log_mean_exp(scores: list[float], gamma: float) -> float:
+    if not scores:
+        return 0.0
+    if abs(gamma) <= 1e-12:
+        return sum(scores) / len(scores)
+    scaled = [gamma * score for score in scores]
+    max_scaled = max(scaled)
+    return (max_scaled + math.log(sum(math.exp(value - max_scaled) for value in scaled) / len(scaled))) / gamma
+
+
+def _multi_text_span_hybrid_scores(
+    query_tokens: list[str],
+    rows: list[dict[str, Any]],
+    *,
+    alpha: float,
+    gamma: float,
+    chunk_max_chars: int,
+) -> dict[tuple[str, int], float]:
+    chunk_to_key: list[tuple[str, int]] = []
+    corpus: list[list[str]] = []
+    for row in rows:
+        key = (str(row.get("paper_id") or ""), int(row.get("page") or 0))
+        chunks = _paragraph_chunks(str(row.get("native_text") or ""), max_chars=max(80, int(chunk_max_chars or 700)))
+        if not chunks:
+            chunks = [""]
+        for chunk in chunks:
+            chunk_to_key.append(key)
+            corpus.append(tokenize(chunk))
+    if not corpus:
+        return {}
+
+    bm25 = BM25Okapi(corpus)
+    bm25_scores = _normalize_list([float(score) for score in (bm25.get_scores(query_tokens) if query_tokens else [0.0] * len(corpus))])
+    semantic_scores = _tfidf_cosine_scores(query_tokens, corpus)
+    scores_by_page: dict[tuple[str, int], list[float]] = defaultdict(list)
+    clamped_alpha = min(1.0, max(0.0, float(alpha)))
+    for key, bm25_score, semantic_score in zip(chunk_to_key, bm25_scores, semantic_scores):
+        scores_by_page[key].append(clamped_alpha * bm25_score + (1.0 - clamped_alpha) * semantic_score)
+    return {key: _log_mean_exp(scores, float(gamma)) for key, scores in scores_by_page.items()}
+
+
 def _reference_numbers(text: str) -> list[int]:
     numbers: list[int] = []
     for match in re.finditer(r"(?:^|\n|\s)\[(\d{1,3})\]\s+", text or ""):
@@ -363,7 +591,13 @@ def _page_routing_strategy(
     if not task_family_strategy_enabled:
         return "global_ranked_pages"
     strategy = multi_strategy if _task_family_bucket(sample) == "multi_paper" else single_strategy
-    if strategy not in {"global_ranked_pages", "top1_candidate_first", "top1_candidate_quota", "multi_candidate_primary_then_global", "per_candidate_primary_then_global"}:
+    if strategy not in {
+        "global_ranked_pages",
+        "top1_candidate_first",
+        "top1_candidate_quota",
+        "multi_candidate_primary_then_global",
+        "per_candidate_primary_then_global",
+    }:
         return "global_ranked_pages"
     return strategy
 
@@ -630,6 +864,11 @@ def rank_global_pages_for_query(
     single_strategy: str = "global_ranked_pages",
     multi_strategy: str = "global_ranked_pages",
     single_top1_min_pages: int = 0,
+    structural_evidence_weight: float = 0.0,
+    multi_text_span_hybrid_enabled: bool = False,
+    multi_text_span_hybrid_alpha: float = 0.75,
+    multi_text_span_hybrid_gamma: float = 4.0,
+    multi_text_span_hybrid_chunk_max_chars: int = 700,
 ) -> dict[str, Any]:
     query_id = str(query_example.get("query_id") or "")
     primary_type = _effective_source_type(query_example)
@@ -652,6 +891,7 @@ def rank_global_pages_for_query(
             "selected_pages_final": [],
             "fallback_reason": "empty_global_page_pool",
         }
+    is_multi_paper_query = _task_family_bucket(query_example) == "multi_paper"
     all_empty = not any(row.get("has_native_text") for row in pool)
     if all_empty and fallback_on_empty_text:
         ranked_fallback = sorted(pool, key=lambda row: (int(row.get("candidate_rank") or 999), int(row.get("page") or 999)))
@@ -669,7 +909,7 @@ def rank_global_pages_for_query(
                     "score_components": {
                         "native_text_bm25": 0.0,
                         "query_overlap": 0.0,
-                        "candidate_rank_prior": _candidate_score_prior(row),
+                        "candidate_rank_prior": 0.0 if is_multi_paper_query else _candidate_score_prior(row),
                         "primary_evidence_type_boost": 0.0,
                         "label_match_boost": 0.0,
                         "section_heading_boost": 0.0,
@@ -711,7 +951,7 @@ def rank_global_pages_for_query(
     bm25_scores = bm25.get_scores(query_tokens) if query_tokens else [0.0] * len(pool)
     query_token_set = set(query_tokens)
     page_count_by_paper = Counter(str(row["paper_id"]) for row in pool)
-    scored: list[tuple[float, dict[str, Any]]] = []
+    scored_rows: list[dict[str, Any]] = []
     for row, bm25_score in zip(pool, bm25_scores):
         text = str(row.get("native_text") or "")
         tokens = set(tokenize(text))
@@ -722,7 +962,8 @@ def rank_global_pages_for_query(
             "section_heading_boost": 0.0,
             "page_position_prior": 0.0,
         }
-        prior = _candidate_score_prior(row)
+        prior = 0.0 if is_multi_paper_query else _candidate_score_prior(row)
+        label_match_boost = 0.0
         position = _page_position_prior(int(row.get("page") or 0), page_count_by_paper[str(row.get("paper_id"))], primary_type)
         evidence_bonus = (
             _evidence_page_bonus(
@@ -735,19 +976,57 @@ def rank_global_pages_for_query(
             else 0.0
         )
         query_hint = _query_hint_bonus(query_example, text) if page_ranking_bonus_enabled else 0.0
+        structural_score = (
+            _structural_evidence_score(query_example, text, primary_type)
+            if page_ranking_bonus_enabled and structural_evidence_weight > 0
+            else 0.0
+        )
         components = {
             "native_text_bm25": float(bm25_score),
             "query_overlap": float(overlap),
             "candidate_rank_prior": prior,
             "primary_evidence_type_boost": rule["primary_evidence_type_boost"],
-            "label_match_boost": rule["label_match_boost"],
+            "label_match_boost": label_match_boost,
             "section_heading_boost": rule["section_heading_boost"],
             "page_position_prior": position,
             "target_locator_bonus": evidence_bonus,
             "query_hint_bonus": query_hint,
+            "structural_evidence_score_raw": structural_score,
         }
-        score = sum(float(value) for value in components.values())
-        scored.append((score, {**row, "score": score, "score_components": components}))
+        base_score = sum(float(value) for key, value in components.items() if key != "structural_evidence_score_raw")
+        base_score += float(structural_evidence_weight or 0.0) * structural_score
+        scored_rows.append({**row, "base_score": base_score, "score_components": components})
+    hybrid_text_span_enabled = bool(
+        multi_text_span_hybrid_enabled
+        and is_multi_paper_query
+    )
+    if hybrid_text_span_enabled:
+        base_scores = {
+            (str(row.get("paper_id") or ""), int(row.get("page") or 0)): float(row.get("base_score") or 0.0)
+            for row in scored_rows
+        }
+        base_norm = _normalize_component(base_scores)
+        hybrid_scores = _multi_text_span_hybrid_scores(
+            tokenize(str(query_example.get("question") or "")),
+            scored_rows,
+            alpha=multi_text_span_hybrid_alpha,
+            gamma=multi_text_span_hybrid_gamma,
+            chunk_max_chars=multi_text_span_hybrid_chunk_max_chars,
+        )
+        for row in scored_rows:
+            key = (str(row.get("paper_id") or ""), int(row.get("page") or 0))
+            components = row["score_components"]
+            components["multi_text_span_hybrid_enabled"] = True
+            components["multi_text_span_hybrid_alpha"] = float(multi_text_span_hybrid_alpha)
+            components["multi_text_span_hybrid_gamma"] = float(multi_text_span_hybrid_gamma)
+            components["multi_text_span_hybrid_chunk_max_chars"] = int(multi_text_span_hybrid_chunk_max_chars or 700)
+            components["multi_text_span_hybrid_score"] = float(hybrid_scores.get(key, 0.0))
+            components["multi_text_span_current_policy_score_norm"] = float(base_norm.get(key, 0.0))
+            row["score"] = float(components["multi_text_span_hybrid_score"]) + float(components["multi_text_span_current_policy_score_norm"])
+    else:
+        for row in scored_rows:
+            row["score"] = float(row.get("base_score") or 0.0)
+    scored = [(float(row.get("score") or 0.0), row) for row in scored_rows]
     ranked_raw = sorted(scored, key=lambda item: item[0], reverse=True)
     ranked_pages: list[dict[str, Any]] = []
     initial_limit = max(0, int(top_p_global))
@@ -805,6 +1084,11 @@ def rank_global_pages_for_query(
         "ranking_source": "native_text",
         "ranking_method": "global_native_text_bm25_rules",
         "page_ranking_bonus_enabled": page_ranking_bonus_enabled,
+        "page_ranking_structural_evidence_weight": float(structural_evidence_weight or 0.0),
+        "page_ranking_multi_text_span_hybrid_enabled": bool(hybrid_text_span_enabled),
+        "page_ranking_multi_text_span_hybrid_alpha": float(multi_text_span_hybrid_alpha),
+        "page_ranking_multi_text_span_hybrid_gamma": float(multi_text_span_hybrid_gamma),
+        "page_ranking_multi_text_span_hybrid_chunk_max_chars": int(multi_text_span_hybrid_chunk_max_chars or 700),
         "page_routing_task_family_strategy_enabled": task_family_strategy_enabled,
         **quota_info,
         "top_k_papers": len(candidates),

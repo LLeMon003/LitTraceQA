@@ -263,6 +263,7 @@ def _rebuild_selected_context(
         context_selection_mode=config.vlm2_context_selection_mode,
         max_context_records=config.vlm2_max_context_records if max_context_records is None else max_context_records,
         max_context_chars=config.vlm2_max_context_chars if max_context_chars is None else max_context_chars,
+        source_type_hints_enabled=config.symbolic_source_type_hints,
     )
 
 
@@ -344,6 +345,7 @@ def _record_successful_prediction(
         answer_contract=answer_contract,
         selected_evidence=selected_context.get("selected_evidence", []),
         symbolic_evidence_standardization=config.symbolic_evidence_standardization,
+        candidate_records=candidates,
     )
     for error in errors:
         error_type = str(error.get("type") or "")

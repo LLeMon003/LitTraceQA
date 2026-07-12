@@ -56,6 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--top-n-records", type=int, default=24)
     p.add_argument("--top-n-visual-records", type=int, default=6)
     p.add_argument("--max-queries", type=int, default=None)
+    p.add_argument("--only-query-ids", default="", help="Comma-separated query ids to process, for controlled pilots.")
     p.add_argument("--resume", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--skip-render", action="store_true")
@@ -91,6 +92,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--page-routing-expansion-step-global", type=int, default=None)
     p.add_argument("--no-sync-processed-run-store", dest="sync_processed_run_store", action="store_false", default=True)
     return p.parse_args()
+
+
+def _split_query_ids(raw: str) -> set[str]:
+    return {item.strip() for item in str(raw or "").split(",") if item.strip()}
 
 
 def _paths(output_dir: Path, resume: bool, dry_run: bool, skip_generation: bool) -> dict[str, Path]:
@@ -1861,6 +1866,9 @@ def main() -> int:
 
     paper_records_cache: dict[str, list[dict[str, Any]]] = {}
     completed_query_ids: set[str] = set()
+    requested_query_ids = _split_query_ids(args.only_query_ids)
+    if requested_query_ids:
+        stats["only_query_ids_requested_count"] = len(requested_query_ids)
     if args.resume and paths["predictions"].exists():
         for row in read_jsonl(paths["predictions"]):
             query_id_value = str(row.get("query_id") or "")
@@ -1874,6 +1882,9 @@ def main() -> int:
             iterator = tqdm(inputs, desc="queries", unit="query")  # type: ignore[assignment]
         for sample in iterator:
             query_id = str(sample.get("query_id", ""))
+            if requested_query_ids and query_id not in requested_query_ids:
+                stats["only_query_ids_skipped_queries"] = int(stats.get("only_query_ids_skipped_queries") or 0) + 1
+                continue
             if query_id in completed_query_ids:
                 stats["resume_skipped_completed_queries"] = int(stats.get("resume_skipped_completed_queries") or 0) + 1
                 continue
@@ -2017,6 +2028,11 @@ def main() -> int:
                     single_strategy=config.page_routing_single_strategy,
                     multi_strategy=config.page_routing_multi_strategy,
                     single_top1_min_pages=config.page_routing_single_top1_min_pages,
+                    structural_evidence_weight=config.page_ranking_structural_evidence_weight,
+                    multi_text_span_hybrid_enabled=config.page_ranking_multi_text_span_hybrid_enabled,
+                    multi_text_span_hybrid_alpha=config.page_ranking_multi_text_span_hybrid_alpha,
+                    multi_text_span_hybrid_gamma=config.page_ranking_multi_text_span_hybrid_gamma,
+                    multi_text_span_hybrid_chunk_max_chars=config.page_ranking_multi_text_span_hybrid_chunk_max_chars,
                 )
                 stats["total_candidate_pages_before_routing"] += int(routing_result.get("total_candidate_pages") or 0)
                 _increment_counter_stat(stats, "page_routing_strategy_usage", routing_result.get("page_routing_strategy") or "unknown")
@@ -2118,6 +2134,7 @@ def main() -> int:
                 context_selection_mode=config.vlm2_context_selection_mode,
                 max_context_records=config.vlm2_max_context_records,
                 max_context_chars=config.vlm2_max_context_chars,
+                source_type_hints_enabled=config.symbolic_source_type_hints,
             )
             if page_routing_enabled and routing_result is not None and config.page_routing_enable_progressive_expansion:
                 ranked_pages = list(routing_result.get("ranked_pages") or [])
@@ -2205,6 +2222,7 @@ def main() -> int:
                         context_selection_mode=config.vlm2_context_selection_mode,
                         max_context_records=config.vlm2_max_context_records,
                         max_context_chars=config.vlm2_max_context_chars,
+                        source_type_hints_enabled=config.symbolic_source_type_hints,
                     )
             if page_routing_enabled and routing_result is not None:
                 total_pages = int(routing_result.get("total_candidate_pages") or 0)
@@ -2310,6 +2328,7 @@ def main() -> int:
                     answer_contract=answer_contract,
                     selected_evidence=selected_prompt.get("selected_evidence", []),
                     symbolic_evidence_standardization=config.symbolic_evidence_standardization,
+                    candidate_records=candidates,
                 )
                 _update_normalization_error_stats(errors, stats)
                 for error in errors:

@@ -13,6 +13,7 @@ from .symbolic_schema import (
     grounding_label_from_record,
     to_official_source_type,
 )
+from .source_type_hints import infer_source_type_hints
 
 
 SOURCE_TYPE_ORDER = {
@@ -177,6 +178,8 @@ def project_context_for_vlm2(record: dict[str, Any], mode: str) -> dict[str, Any
     }
     if projected["grounding_label"] is None:
         projected.pop("grounding_label", None)
+    if record.get("source_type_hints"):
+        projected["source_type_hints"] = record.get("source_type_hints")
     if mode == "cropped_image":
         projected["image_ref"] = _record_image_ref(record)
     return projected
@@ -304,6 +307,7 @@ def select_symbolic_contexts(
     context_selection_mode: str = "page_all_symbolic",
     max_context_records: int = 0,
     max_context_chars: int = 0,
+    source_type_hints_enabled: bool = True,
 ) -> dict[str, Any]:
     allow_header_footer = _query_needs_header_footer(query)
     valid = [
@@ -382,6 +386,10 @@ def select_symbolic_contexts(
             "image_path": _image_path_for(record, processed, parser_model_slug),
             "figure_crop_path": record.get("figure_crop_path"),
         }
+        if source_type_hints_enabled:
+            hints = infer_source_type_hints(selected)
+            if hints:
+                selected["source_type_hints"] = hints
         selected["_page_status"] = record.get("_page_status") or record.get("page_status")
         ranked.append(selected)
     ranked.sort(key=lambda item: item["score"], reverse=True)

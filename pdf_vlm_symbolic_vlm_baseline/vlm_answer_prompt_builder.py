@@ -164,6 +164,8 @@ def _project_evidence_for_prompt(evidence: dict[str, Any], contract: dict[str, A
             projected["table_structure"] = table_structure
     if isinstance(evidence.get("grounding_label"), dict):
         projected["grounding_label"] = evidence.get("grounding_label")
+    if isinstance(evidence.get("source_type_hints"), list) and evidence.get("source_type_hints"):
+        projected["source_type_hints"] = evidence.get("source_type_hints")
     if evidence.get("image_ref"):
         projected["image_ref"] = evidence.get("image_ref")
     return projected
@@ -205,6 +207,8 @@ def _project_supporting_evidence(evidence: dict[str, Any]) -> dict[str, Any]:
     }
     if isinstance(evidence.get("grounding_label"), dict):
         projected["grounding_label"] = evidence.get("grounding_label")
+    if isinstance(evidence.get("source_type_hints"), list) and evidence.get("source_type_hints"):
+        projected["source_type_hints"] = evidence.get("source_type_hints")
     return projected
 
 
@@ -252,6 +256,8 @@ def _build_evidence_packets(
             }
             if isinstance(primary.get("grounding_label"), dict):
                 packet["grounding_label"] = primary.get("grounding_label")
+            if isinstance(primary.get("source_type_hints"), list) and primary.get("source_type_hints"):
+                packet["source_type_hints"] = primary.get("source_type_hints")
             if source_type == "table":
                 table_schema = (contract.get("table") or {}).get("table_schema") or []
                 table_structure = table_text_to_structure(str(primary.get("text") or ""), table_schema)
@@ -362,7 +368,7 @@ def build_symbolic_answer_prompt(
     user = (
         "Use only the provided candidate metadata and selected symbolic evidence packets. These packets were generated from rendered PDF page images by a separate VLM parser "
         "and validated by a symbolic layer.\n\n"
-        "You will receive paper_evidence_packets grouped by paper_id. Each evidence packet contains primary_source_type, page, label, primary_text, optional supporting_text, optional supporting_evidence, optional grounding_label, and for some table packets an optional table_structure derived from the table text. primary_source_type must be one of text_span, table, figure, equation_algorithm, citation_context. "
+        "You will receive paper_evidence_packets grouped by paper_id. Each evidence packet contains primary_source_type, page, label, primary_text, optional supporting_text, optional supporting_evidence, optional grounding_label, optional source_type_hints, and for some table packets an optional table_structure derived from the table text. primary_source_type must be one of text_span, table, figure, equation_algorithm, citation_context. source_type_hints mark cases where the same packet text visibly contains another official evidence type, for example a text_span that contains a table caption or equation. "
         "Ranking scores, retrieval scores, selector scores, parser confidence values, bbox, and internal record IDs are intentionally withheld from this prompt. "
         "Do not invent page numbers, table_id, figure_id, equation_id, algorithm_id, citation_id, image references, or hidden record IDs. Use only the provided evidence.\n\n"
         + (
@@ -408,9 +414,9 @@ def build_symbolic_answer_prompt(
             else ""
         )
         + "5. evidence paper_id must be from candidate papers.\n"
-        "6. evidence locator.page must come from paper_evidence_packets for the same paper_id and source_type.\n"
+        "6. evidence locator.page must come from paper_evidence_packets for the same paper_id. evidence.source_type should normally equal primary_source_type, but it may use a source_type_hints.source_type from the same packet when the hint better matches the evidence needed by the question.\n"
         "7. Do not invent table_id, figure_id, equation_id, algorithm_id, citation_id, bbox, record_id, or page.\n"
-        "8. For table/figure/equation/algorithm/citation labels, only output locator IDs that match evidence packet grounding_label.value. If label is null or no grounding_label is provided, do not output an ID.\n"
+        "8. For table/figure/equation/algorithm/citation labels, only output locator IDs that match evidence packet grounding_label.value or a locator value inside source_type_hints for the same packet. If label is null and no grounding_label or source_type_hints locator is provided, do not output an ID.\n"
         "9. If required_answer_fields includes an answer type, include that answer field. If required_answer_fields does not include an answer type, omit that answer field.\n"
         "10. For table answers, use table_schema column names exactly.\n"
         "11. For table evidence packets with table_structure, align values by table_structure.columns and table_structure.rows before answering.\n"
