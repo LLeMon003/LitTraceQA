@@ -1,12 +1,17 @@
 .env
 prompt4codex.md
 github_updatescript.txt
+PLAN.md
 
 Ce_littraceqa_baseline_main/
+Ce_littraceqa_baseline_Ver.2.3_main/
 pdf_vlm_symbolic_vlm_opt_baseline/
 outputs/
 raw_pdfs/
 processed_pdfs/
+beifen/
+littraceqa_successor_baseline/
+
 
 __pycache__/
 *.pyc
