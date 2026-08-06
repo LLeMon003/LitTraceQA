@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from pdf_docling_rerank_selection_generation_pipeline.section_relevance import (
+    INSTRUCTIONS,
     SectionRelevanceConfig,
     _prefix,
     _record_line,
@@ -22,6 +23,12 @@ def _record(identifier, source_type, text, *, page=1, label="", order=1):
 
 
 class SectionRelevanceTests(unittest.TestCase):
+    def test_minimal_complete_support_instruction_retains_comparison_rule(self):
+        prompt = INSTRUCTIONS["v4_complete_support_minimal"]
+        self.assertIn("necessary supporting facts", prompt)
+        self.assertIn("unnamed baseline", prompt)
+        self.assertLess(len(prompt), len(INSTRUCTIONS["v3_complete_support"]))
+
     def test_query_object_targets_preserve_explicit_locators(self):
         targets = query_object_targets("Compare Table 2, Fig. 4, Eq. (6), and the 24th reference.")
         self.assertEqual(targets["table"], 2)

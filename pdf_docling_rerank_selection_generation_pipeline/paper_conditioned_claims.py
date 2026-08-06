@@ -1,4 +1,4 @@
-"""Candidate-paper-conditioned lexical claims for multi-paper routing."""
+"""Candidate-metadata evidence planning for multi-paper package routing."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -8,8 +8,11 @@ import re
 from pathlib import Path
 from typing import Any
 
+from .symbolic_schema import OFFICIAL_EVIDENCE_SOURCE_TYPES
 
-PROMPT_VERSION = "v1_candidate_local_evidence"
+
+PROMPT_VERSION = "v3_compact_evidence_plan"
+ALLOWED_SOURCE_TYPES = set(OFFICIAL_EVIDENCE_SOURCE_TYPES)
 
 
 @dataclass(frozen=True)
@@ -55,24 +58,23 @@ def _prompt(query: str, primary_evidence_type: str | None, papers: list[dict[str
     ]
     return [
         {"role": "system", "content": (
-            "You create lexical retrieval queries for local evidence inside each candidate scientific paper. "
-            "A question can name one method while correct evidence comes from comparison baselines or related papers. "
-            "For every provided paper, write one concise paper-local claim describing the fact to retrieve from that "
-            "paper to help answer the question. Do not guess facts. Preserve requested dataset, metric, setting, and "
-            "property, but replace unknown values with [VALUE]. Return JSON only: "
-            '{"claims":[{"paper_id":"...","hypothetical_evidence":"... [VALUE]"}]}.'
+            "Plan evidence retrieval, not an answer. From the candidate metadata, identify only papers likely needed and "
+            "the evidence type to look for. Preserve named methods, datasets, metrics, settings, and comparisons. "
+            "Do not invent values or facts. Return JSON only."
         )},
         {"role": "user", "content": (
             f"Question: {query}\nPrimary evidence type: {primary_evidence_type or 'unknown'}\n"
-            f"Candidate papers: {json.dumps(compact, ensure_ascii=False)}"
+            f"Candidate papers: {json.dumps(compact, ensure_ascii=False)}\n"
+            "Return {\"cross_paper\":true|false,\"plans\":[{\"paper_id\":\"...\","
+            "\"source_types\":[\"table\"],\"retrieval_query\":\"concise evidence terms\"}]}."
         )},
     ]
 
 
-def generate_paper_conditioned_claims(
+def generate_evidence_plan(
     *, query_id: str | None, query: str, primary_evidence_type: str | None, candidate_papers: list[dict[str, Any]],
     config: PaperConditionedClaimsConfig, client: Any, cache_root: Path,
-) -> tuple[list[dict[str, str]], list[str], bool]:
+) -> tuple[dict[str, Any], list[str], bool]:
     papers = [dict(paper) for paper in candidate_papers[: max(0, config.max_papers)] if paper.get("paper_id")]
     key = {
         "prompt_version": PROMPT_VERSION, "query_id": query_id, "query": query,
@@ -80,7 +82,7 @@ def generate_paper_conditioned_claims(
             {field: paper.get(field) for field in ("paper_id", "title", "abstract")} for paper in papers
         ], "model": config.model, "temperature": config.temperature, "max_tokens": config.max_tokens,
     }
-    path = cache_root / "paper_conditioned" / f"{_hash(key)}.json"
+    path = cache_root / "evidence_planning" / f"{_hash(key)}.json"
     warnings: list[str] = []
     raw = ""
     if config.cache_enabled and path.exists():
@@ -99,23 +101,35 @@ def generate_paper_conditioned_claims(
         raw = str(response.get("content") or "")
     value = _extract_json(raw)
     allowed = {str(paper.get("paper_id") or "") for paper in papers}
-    claims: list[dict[str, str]] = []
+    plans: list[dict[str, Any]] = []
     seen: set[str] = set()
-    for item in value.get("claims") or []:
+    for item in value.get("plans") or []:
         if not isinstance(item, dict):
             continue
         paper_id = str(item.get("paper_id") or "")
-        text = re.sub(r"\s+", " ", str(item.get("hypothetical_evidence") or "")).strip()
+        text = re.sub(r"\s+", " ", str(item.get("retrieval_query") or "")).strip()
+        source_types = [str(source) for source in item.get("source_types") or [] if str(source) in ALLOWED_SOURCE_TYPES]
         if paper_id not in allowed or not text or paper_id in seen:
             continue
         seen.add(paper_id)
-        claims.append({"paper_id": paper_id, "hypothetical_evidence": text})
+        plans.append({"paper_id": paper_id, "source_types": list(dict.fromkeys(source_types)), "retrieval_query": text})
     missing = allowed - seen
     for paper_id in sorted(missing):
-        warnings.append(f"missing_claim:{paper_id}")
-    if not claims:
-        raise ValueError("paper-conditioned claims contained no usable routes")
+        warnings.append(f"missing_plan:{paper_id}")
+    if not plans:
+        raise ValueError("evidence plan contained no usable routes")
+    plan = {"cross_paper": bool(value.get("cross_paper")), "plans": plans}
     if config.cache_enabled and not cached:
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"prompt_version": PROMPT_VERSION, "raw_generation": raw, "claims": claims}, ensure_ascii=False), encoding="utf-8")
+        path.write_text(json.dumps({"prompt_version": PROMPT_VERSION, "raw_generation": raw, "plan": plan}, ensure_ascii=False), encoding="utf-8")
+    return plan, warnings, cached
+
+
+def generate_paper_conditioned_claims(**kwargs: Any) -> tuple[list[dict[str, str]], list[str], bool]:
+    """Compatibility wrapper for callers that only need paper-local routes."""
+    plan, warnings, cached = generate_evidence_plan(**kwargs)
+    claims = [
+        {"paper_id": item["paper_id"], "hypothetical_evidence": item["retrieval_query"]}
+        for item in plan["plans"]
+    ]
     return claims, warnings, cached

@@ -17,6 +17,8 @@ jsonschema==4.23.0
 # OpenAI-compatible API clients
 openai==1.59.9
 httpx==0.28.1
+# Required when the environment routes model downloads through a SOCKS proxy.
+socksio==1.0.0
 
 # Local E5 section-relevance backend. The verified environment uses the CUDA 13
 # Torch build; choose the matching wheel/index when recreating a GPU environment.
@@ -33,3 +35,5 @@ pillow==10.4.0
 # Default PDF transcription backend. Its OCR and layout packages are installed
 # transitively through Docling's standard dependency set.
 docling==2.113.0
+# Prefer RapidOCR's cached ONNX models over first-run Torch weight downloads.
+onnxruntime==1.28.0

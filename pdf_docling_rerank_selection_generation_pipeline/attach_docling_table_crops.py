@@ -18,6 +18,12 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--hierarchy-input", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--processed-output-dir", required=True)
+    parser.add_argument(
+        "--crop-output-dir",
+        default="",
+        help="Optional separate root that receives <paper_id>/raw_docling_output/table_crops/*.png. "
+        "Defaults to --processed-output-dir so existing invocations keep rendering into the docling root.",
+    )
     parser.add_argument("--pdf-output-dir", default="raw_pdfs/pdf")
     parser.add_argument("--dpi", type=int, default=180)
     parser.add_argument("--only-query-ids", default="", help="Optional comma-separated query IDs.")
@@ -74,6 +80,7 @@ def _render_crop(pdf_path: Path, table: dict[str, Any], output_path: Path, dpi: 
 def main() -> int:
     args = _args()
     processed_root = Path(args.processed_output_dir)
+    crop_root = Path(args.crop_output_dir) if args.crop_output_dir else processed_root
     pdf_root = Path(args.pdf_output_dir)
     indices: dict[str, dict[int, dict[str, Any]]] = {}
     attached = rendered = unresolved = 0
@@ -95,7 +102,7 @@ def main() -> int:
                 table_index = _docling_table_index(raw)
                 indices[paper_id] = table_index
             table = table_index.get(number)
-            crop_path = processed_root / paper_id / "raw_docling_output" / "table_crops" / f"table_{number:03d}.png"
+            crop_path = crop_root / paper_id / "raw_docling_output" / "table_crops" / f"table_{number:03d}.png"
             if table and not crop_path.is_file():
                 _render_crop(pdf_root / f"{paper_id}.pdf", table, crop_path, args.dpi)
             # Saving is best effort (some malformed PDFs acknowledge a render

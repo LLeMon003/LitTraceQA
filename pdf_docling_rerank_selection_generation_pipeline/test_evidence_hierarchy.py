@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 
 from .evidence_hierarchy import (
     attach_cards,
@@ -8,6 +11,7 @@ from .evidence_hierarchy import (
     hierarchy_metrics,
     hierarchy_prompt_projection,
     keyed_hierarchy_prompt_projection,
+    load_processed_records,
     resolve_claim_support_keys,
     verify_llm_cards,
     _query_aware_extractive_proposition,
@@ -43,6 +47,18 @@ class EvidenceHierarchyTests(unittest.TestCase):
             [self.anchor], [{"paper_id": "paper", "title": "Paper", "abstract": "Abstract."}],
             {"paper": [self.before, self.anchor, self.after]}, l1_max_chars=240, l3_paper_chars=100,
         )
+
+    def test_processed_loader_restores_crop_from_debug_record(self):
+        with tempfile.TemporaryDirectory() as directory:
+            paper_root = Path(directory) / "paper"
+            paper_root.mkdir()
+            runtime = dict(self.anchor, crop_path=None)
+            debug = dict(self.anchor, crop_path="/tmp/figure.png", figure_crop_path="/tmp/figure.png")
+            (paper_root / "symbolic_records.runtime.jsonl").write_text(json.dumps(runtime) + "\n", encoding="utf-8")
+            (paper_root / "symbolic_records.debug.jsonl").write_text(json.dumps(debug) + "\n", encoding="utf-8")
+            records = load_processed_records(directory, ["paper"])
+        self.assertEqual(records["paper"][0]["crop_path"], "/tmp/figure.png")
+        self.assertEqual(records["paper"][0]["figure_crop_path"], "/tmp/figure.png")
 
     def test_l0_preserves_anchor_and_l1_context_is_provenanced(self):
         hierarchy = self._hierarchy()

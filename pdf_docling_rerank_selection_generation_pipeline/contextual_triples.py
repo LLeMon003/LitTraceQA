@@ -655,9 +655,8 @@ def visual_triple_messages(question: str, window: dict[str, Any]) -> list[dict[s
         "caption_hint": (window.get("object_context") or {}).get("caption"), "support_refs": window.get("support_refs") or [],
     }
     system = (
-        "Extract one grounded contextual triple from a scientific figure crop. Do not answer the question. "
-        "Use only literal visible strings and unambiguous visible relationships. Do not infer performance, causality, or method properties. "
-        "Return JSON only."
+        "Extract one grounded triple from this figure crop. Use only literal visible text and unambiguous relationships; "
+        "do not infer performance, causality, or method properties. Return JSON only."
     )
     user = (
         "Return {\"window_id\":\"W001\",\"subject\":\"...\",\"predicate\":\"reports|uses|contains|states\",\"object\":\"...\","
@@ -673,8 +672,8 @@ def visual_triple_verification_messages(window: dict[str, Any], proposal: dict[s
         "object": proposal.get("object"), "qualifiers": proposal.get("qualifiers") or {}, "visible_strings": proposal.get("visible_strings") or [],
     }
     system = (
-        "Verify a proposed contextual triple against one scientific figure crop. Approve only if every entity, value, condition, and relation is "
-        "directly visible. The caption hint is not proof for absent visual facts. Return JSON only."
+        "Approve only when every triple entity, value, condition, and relation is directly visible in this crop. "
+        "The caption is not proof for absent visual facts. Return JSON only."
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": "Return {\"supported\":true|false,\"reason\":\"brief\"}.\n" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))}]
 
@@ -767,12 +766,8 @@ def triple_generation_messages(
         compact.append(payload)
         used += len(encoded)
     system = (
-        "Extract grounded contextual triples for scientific QA. Do not answer the question. "
-        "For every supplied non-empty L1 window, emit exactly one triple. If no semantic relation is unambiguous, use predicate states and an extractive object. "
-        "For every triple, retain only statements directly supported by the supplied L1 window. "
-        "A triple must include subject, predicate, object, qualifiers (dataset/metric/split/condition/comparison when present), "
-        "support_refs, and exact support_quotes. Never infer a value, relation, or visual fact absent from the supplied window. "
-        "For tables, never separate a value from its header and row condition. Return JSON only."
+        "For each non-empty L1 window, emit one grounded triple; otherwise use predicate states with an extractive object. "
+        "Include exact support_quotes and only supplied support_refs. Never infer facts. Keep table values with their header and row condition. Return JSON only."
     )
     user = (
         "Return {\"triples\":[{\"window_id\":\"W001\",\"subject\":\"...\",\"predicate\":\"...\",\"object\":\"...\","
@@ -852,10 +847,8 @@ def sufficiency_messages(question: str, hierarchy: dict[str, Any], *, max_triple
         "triples": triples,
     }
     system = (
-        "Decide whether the supplied grounded contextual triples are sufficient to answer the scientific question. "
-        "Do not answer the question. Do not use outside knowledge. If a value, comparison condition, entity identity, or reasoning hop is missing, "
-        "request the minimum specific triple IDs to expand first to L1; request L0 only when L1 cannot resolve the gap. "
-        "Return JSON only."
+        "Decide whether these grounded triples answer the question without outside knowledge. If a value, condition, identity, or reasoning hop is missing, "
+        "request the fewest triple IDs: L1 first, L0 only when needed. Return JSON only."
     )
     user = (
         "Return {\"sufficient\":true|false,\"covered_claim_ids\":[\"Q01\"],\"missing_claim_ids\":[],"

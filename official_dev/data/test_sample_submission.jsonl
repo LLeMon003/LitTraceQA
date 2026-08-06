@@ -1,0 +1,71 @@
+{"query_id": "ltqa_033b9d024c4f0dee", "gold_papers": [], "answer": {"table": {"rows": [{"paper": "PLACEHOLDER", "detail": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_03af2c583a696a04", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_090478d0ddf8d27f", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_0a98ae6877634bf1", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_0ebcb34dc966f506", "gold_papers": [], "answer": {"table": {"rows": [{"dataset": "PLACEHOLDER", "sese_inference_total_time_s": "PLACEHOLDER", "sese_inference_graphics_memory_gb": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_16a585ec64d3fe52", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_1a7bdefccf618e42", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_1d16eb94175e070f", "gold_papers": [], "answer": {"table": {"rows": [{"quantity": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_1d2f37bc9076dcff", "gold_papers": [], "answer": {"table": {"rows": [{"adaptation_setting": "PLACEHOLDER", "sciq_score": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_22ff7b719c5625d4", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_2391a0f9afd48008", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_25546519dfb273c8", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_26a8f5550df35020", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_340528fbecedf89a", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_394b3fcabbc496d9", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_3ad5f1a526f9f732", "gold_papers": [], "answer": {"table": {"rows": [{"dataset": "PLACEHOLDER", "ndcg_at_10": 0, "map_at_10": 0}]}}, "evidence": []}
+{"query_id": "ltqa_3bfb8111c92ba3d5", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_40ab1c7fd673a09f", "gold_papers": [], "answer": {"table": {"rows": [{"method": "PLACEHOLDER", "efficiency_metric": "PLACEHOLDER", "reported_value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_4900eb2c71c890c8", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_4de695d77c51ca01", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_571b8ccefde36062", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_5b08acb319329757", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_5b2e215fa95f0a6e", "gold_papers": [], "answer": {"table": {"rows": [{"method": "PLACEHOLDER", "hyperparameter": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_5e0dfcb644ec0a04", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_62588bf6eaca46d0", "gold_papers": [], "answer": {"table": {"rows": [{"method_metric": "PLACEHOLDER", "Rm-2": 0, "Off-0": 0}]}}, "evidence": []}
+{"query_id": "ltqa_69178ae8aa769eda", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_69ae5bd5f986062e", "gold_papers": [], "answer": {"table": {"rows": [{"method": "PLACEHOLDER", "prompt_template": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_729fa13078b8135f", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_751e3be5540b9fa5", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_7d7e93465a7c030d", "gold_papers": [], "answer": {"table": {"rows": [{"method": "PLACEHOLDER", "quantity": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_8e7d0874e09f6377", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_97a49a0392eeaee0", "gold_papers": [], "answer": {"table": {"rows": [{"quantity": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_98ff929cb222a1b3", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_9c93b4c3fdb98c15", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_9f1c905a5cf41a70", "gold_papers": [], "answer": {"table": {"rows": [{"setting": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_a24c157315314b97", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_a2c8b9763a7ce26e", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_a467625518ca3ac4", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_a4bf90a191e1bac8", "gold_papers": [], "answer": {"table": {"rows": [{"attribute": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_a805cd7e63c6a6a3", "gold_papers": [], "answer": {"table": {"rows": [{"paper": "PLACEHOLDER", "vocabulary_symbol": "PLACEHOLDER", "core_recursive_or_definitional_expression": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_ab60eb571239314b", "gold_papers": [], "answer": {"table": {"rows": [{"method": "PLACEHOLDER", "per_step_expression": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_b0afd4b6df08954b", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_b18f17b22f0bfdbe", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_b61b62d2801d5f07", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_ba83892a544258a6", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_bde426d34c7e10bd", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_bed9aa4a54795d63", "gold_papers": [], "answer": {"table": {"rows": [{"paper": "PLACEHOLDER", "quantity_asked": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_c0b2f8616b032d4b", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_c4708554d734f4e1", "gold_papers": [], "answer": {"table": {"rows": [{"cited_work": "PLACEHOLDER", "flowchef_title": "PLACEHOLDER", "noiseschedule_title": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_c95d638c01295a12", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_cbad41e189930190", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_cf29b3a6608039ea", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_cf4bd6505d859121", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_d2b9a56db69fe43c", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_d89df503ec813f2e", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_dada5a958af5068b", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_db8e3f7d548a7d24", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_dc59b0be539a1b22", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_dcaf2cccb716dcea", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_dd9546c035c87d9c", "gold_papers": [], "answer": {"table": {"rows": [{"paper": "PLACEHOLDER", "cited_prior_work": "PLACEHOLDER", "attached_technical_description": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_de53de0c4394d292", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_e025ced58eec5fd9", "gold_papers": [], "answer": {"table": {"rows": [{"method": "PLACEHOLDER", "objective_role": "PLACEHOLDER", "definition": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_e721a5153814527f", "gold_papers": [], "answer": {"table": {"rows": [{"subset": "PLACEHOLDER", "chrF": 0, "COMET": 0}]}}, "evidence": []}
+{"query_id": "ltqa_e9269a60704ac5c6", "gold_papers": [], "answer": {"table": {"rows": [{"metric": "PLACEHOLDER", "value": "PLACEHOLDER"}]}}, "evidence": []}
+{"query_id": "ltqa_eb04a1b29408f7bb", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_f0de7fb4352ad29c", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_f399a24775b6f0b8", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_f6ae14ff5b8d177b", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_f7ead099a16ddbcd", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_fca1b7d3c8a697aa", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}
+{"query_id": "ltqa_ffb8499a6cbd3c4d", "gold_papers": [], "answer": {"multiple_choice": {"gold": "A"}}, "evidence": []}

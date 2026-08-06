@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://huggingface.co/datasets/REPLACE_WITH_NAMESPACE/LitTraceQA/schema/littraceqa.schema.json",
-  "title": "LitTraceQA sample",
+  "$id": "https://huggingface.co/datasets/LitTraceQA/LitTraceQA/resolve/main/schema/littraceqa.schema.json",
+  "title": "LitTraceQA public gold record",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -16,133 +16,59 @@
     "answer"
   ],
   "properties": {
-    "query_id": {
-      "type": "string",
-      "minLength": 1
-    },
-    "benchmark": {
-      "const": "LitTraceQA"
-    },
+    "query_id": {"type": "string", "minLength": 1},
+    "benchmark": {"const": "LitTraceQA"},
     "task_family": {
-      "type": "string",
-      "enum": [
-        "hidden_source_single_paper",
-        "multi_paper"
-      ]
+      "enum": ["hidden_source_single_paper", "multi_paper"]
     },
-    "primary_evidence_type": {
-      "$ref": "#/$defs/evidence_type"
+    "primary_evidence_type": {"$ref": "#/$defs/evidence_type"},
+    "question": {"type": "string", "minLength": 1},
+    "answer_types": {"$ref": "#/$defs/answer_types"},
+    "gold_papers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/gold_paper"}
     },
-    "question": {
-      "type": "string",
-      "minLength": 1
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/evidence"}
+    },
+    "answer": {"$ref": "#/$defs/answer"}
+  },
+  "$defs": {
+    "evidence_type": {
+      "enum": ["table", "figure", "text_span", "equation_algorithm", "citation_context"]
     },
     "answer_types": {
       "type": "array",
       "minItems": 1,
       "uniqueItems": true,
-      "items": {
-        "$ref": "#/$defs/answer_type"
-      }
-    },
-    "gold_papers": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "$ref": "#/$defs/gold_paper"
-      }
-    },
-    "evidence": {
-      "type": "array",
-      "minItems": 1,
-      "items": {
-        "$ref": "#/$defs/evidence"
-      }
-    },
-    "answer": {
-      "$ref": "#/$defs/answer"
-    }
-  },
-  "$defs": {
-    "evidence_type": {
-      "type": "string",
-      "enum": [
-        "table",
-        "figure",
-        "text_span",
-        "equation_algorithm",
-        "citation_context",
-        "paper_summary"
-      ]
-    },
-    "answer_type": {
-      "type": "string",
-      "enum": [
-        "freeform",
-        "multiple_choice",
-        "table"
-      ]
+      "items": {"enum": ["freeform", "multiple_choice", "table"]}
     },
     "gold_paper": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "paper_id",
-        "title",
-        "venue",
-        "year"
-      ],
+      "required": ["paper_id", "title", "venue", "year"],
       "properties": {
-        "paper_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "title": {
-          "type": "string",
-          "minLength": 1
-        },
-        "venue": {
-          "type": "string",
-          "minLength": 1
-        },
-        "year": {
-          "type": "integer"
-        }
+        "paper_id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "venue": {"type": "string", "minLength": 1},
+        "year": {"type": "integer"}
       }
     },
     "evidence": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "evidence_id",
-        "paper_id",
-        "source_type",
-        "evidence_text_or_value",
-        "locator"
-      ],
+      "required": ["evidence_id", "paper_id", "source_type", "locator"],
       "properties": {
-        "evidence_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "paper_id": {
-          "type": "string",
-          "minLength": 1
-        },
-        "source_type": {
-          "$ref": "#/$defs/evidence_type"
-        },
+        "evidence_id": {"type": "string", "minLength": 1},
+        "paper_id": {"type": "string", "minLength": 1},
+        "source_type": {"$ref": "#/$defs/evidence_type"},
         "evidence_text_or_value": {
-          "type": [
-            "string",
-            "number",
-            "boolean",
-            "null"
-          ]
+          "type": ["string", "number", "boolean", "null"]
         },
-        "locator": {
-          "$ref": "#/$defs/locator"
-        }
+        "locator": {"$ref": "#/$defs/locator"}
       }
     },
     "locator": {
@@ -150,209 +76,80 @@
       "additionalProperties": false,
       "minProperties": 1,
       "properties": {
-        "page": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "table_id": {
-          "type": "string"
-        },
-        "row": {
-          "type": "string"
-        },
-        "column": {
-          "type": "string"
-        },
-        "figure_id": {
-          "type": "string"
-        },
-        "region": {
-          "type": "string"
-        },
-        "section": {
-          "type": "string"
-        },
-        "paragraph_id": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "sentence_start": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "sentence_end": {
-          "type": "integer",
-          "minimum": 1
-        },
-        "equation_id": {
-          "type": "string"
-        },
-        "algorithm_id": {
-          "type": "string"
-        },
-        "step": {
-          "type": [
-            "integer",
-            "string"
-          ]
-        },
-        "citation_id": {
-          "type": "string"
-        },
-        "cited_paper": {
-          "type": "string"
-        },
-        "scope": {
-          "type": "string"
-        }
+        "page": {"type": "integer", "minimum": 1},
+        "table_id": {"type": "string"},
+        "row": {"type": "string"},
+        "column": {"type": "string"},
+        "figure_id": {"type": "string"},
+        "region": {"type": "string"},
+        "section": {"type": "string"},
+        "paragraph_id": {"type": "integer", "minimum": 1},
+        "sentence_start": {"type": "integer", "minimum": 1},
+        "sentence_end": {"type": "integer", "minimum": 1},
+        "equation_id": {"type": "string"},
+        "algorithm_id": {"type": "string"},
+        "citation_id": {"type": "string"},
+        "cited_paper": {"type": "string"}
       }
     },
     "answer": {
       "type": "object",
       "additionalProperties": false,
+      "minProperties": 1,
       "properties": {
-        "freeform": {
-          "$ref": "#/$defs/freeform_answer"
-        },
-        "multiple_choice": {
-          "$ref": "#/$defs/multiple_choice_answer"
-        },
-        "table": {
-          "$ref": "#/$defs/table_answer"
-        }
-      },
-      "anyOf": [
-        {
-          "required": [
-            "freeform"
-          ]
-        },
-        {
-          "required": [
-            "multiple_choice"
-          ]
-        },
-        {
-          "required": [
-            "table"
-          ]
-        }
-      ]
+        "freeform": {"$ref": "#/$defs/freeform_answer"},
+        "multiple_choice": {"$ref": "#/$defs/multiple_choice_answer"},
+        "table": {"$ref": "#/$defs/table_answer"}
+      }
     },
     "freeform_answer": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "text"
-      ],
-      "properties": {
-        "text": {
-          "type": "string",
-          "minLength": 1
-        }
-      }
+      "required": ["text"],
+      "properties": {"text": {"type": "string", "minLength": 1}}
     },
     "multiple_choice_answer": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "options",
-        "gold"
-      ],
+      "required": ["options", "gold"],
       "properties": {
-        "options": {
-          "$ref": "#/$defs/multiple_choice_options"
-        },
-        "gold": {
-          "$ref": "#/$defs/option_letter"
-        }
+        "options": {"$ref": "#/$defs/multiple_choice_options"},
+        "gold": {"type": "string", "pattern": "^[A-Z]$"}
       }
     },
     "multiple_choice_options": {
       "type": "object",
+      "minProperties": 2,
       "additionalProperties": false,
-      "required": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ],
-      "properties": {
-        "A": {
-          "type": "string",
-          "minLength": 1
-        },
-        "B": {
-          "type": "string",
-          "minLength": 1
-        },
-        "C": {
-          "type": "string",
-          "minLength": 1
-        },
-        "D": {
-          "type": "string",
-          "minLength": 1
-        }
+      "patternProperties": {
+        "^[A-Z]$": {"type": "string", "minLength": 1}
       }
-    },
-    "option_letter": {
-      "type": "string",
-      "enum": [
-        "A",
-        "B",
-        "C",
-        "D"
-      ]
     },
     "table_answer": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "schema",
-        "rows"
-      ],
+      "required": ["schema", "rows"],
       "properties": {
         "schema": {
           "type": "array",
           "minItems": 1,
-          "items": {
-            "$ref": "#/$defs/table_column"
-          }
+          "items": {"$ref": "#/$defs/table_column"}
         },
         "rows": {
           "type": "array",
           "minItems": 1,
-          "items": {
-            "type": "object"
-          }
+          "items": {"type": "object"}
         }
       }
     },
     "table_column": {
       "type": "object",
       "additionalProperties": false,
-      "required": [
-        "name",
-        "type",
-        "is_row_key"
-      ],
+      "required": ["name", "type", "is_row_key"],
       "properties": {
-        "name": {
-          "type": "string",
-          "minLength": 1
-        },
-        "type": {
-          "type": "string",
-          "enum": [
-            "string",
-            "number",
-            "boolean"
-          ]
-        },
-        "is_row_key": {
-          "type": "boolean"
-        }
+        "name": {"type": "string", "minLength": 1},
+        "type": {"enum": ["string", "number", "boolean"]},
+        "is_row_key": {"type": "boolean"}
       }
     }
   }

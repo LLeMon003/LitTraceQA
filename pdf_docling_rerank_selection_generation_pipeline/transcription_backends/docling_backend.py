@@ -9,6 +9,13 @@ from .base import TranscribedDocument, TranscribedElement
 from ..table_structure import docling_table_to_structure
 
 
+def _cached_artifacts_path(cache_dir: Path, configured_path: Path | None) -> Path | None:
+    """Use a complete local Docling cache without issuing Hub metadata requests."""
+    path = configured_path or cache_dir / "models"
+    required = ("docling-project--docling-layout-heron", "docling-project--docling-models")
+    return path if all((path / name).is_dir() for name in required) else None
+
+
 def _json_safe(obj: Any) -> Any:
     try:
         json.dumps(obj)
@@ -263,9 +270,13 @@ class DoclingTranscriptionBackend:
         else:
             from docling.datamodel.base_models import InputFormat  # type: ignore
             from docling.datamodel.pipeline_options import PdfPipelineOptions  # type: ignore
+            from docling.datamodel.settings import settings  # type: ignore
             from docling.document_converter import PdfFormatOption  # type: ignore
 
             pipeline_options = PdfPipelineOptions()
+            cached_artifacts = _cached_artifacts_path(settings.cache_dir, settings.artifacts_path)
+            if cached_artifacts is not None:
+                pipeline_options.artifacts_path = cached_artifacts
             docling_do_ocr = bool(kwargs.get("docling_do_ocr", True))
             pipeline_options.do_ocr = docling_do_ocr
             pipeline_options.generate_picture_images = True

@@ -99,17 +99,33 @@ def _is_context_candidate(record: dict[str, Any]) -> bool:
 
 
 def load_processed_records(processed_root: str | Path | None, paper_ids: Iterable[str]) -> dict[str, list[dict[str, Any]]]:
-    """Load local parser records only; this never touches official gold data."""
+    """Load local parser records, restoring crop fields from parser debug artifacts.
+
+    Standardized runtime records intentionally omit backend payloads.  Their
+    paired debug records retain local crop paths, and the main pipeline merges
+    those fields before selection.  The hierarchy must use the same merge or
+    visual evidence becomes text-only after frozen selection.
+    """
     root = Path(processed_root) if processed_root else None
     result: dict[str, list[dict[str, Any]]] = {}
     if root is None or not root.is_dir():
         return result
     for paper_id in sorted({str(value) for value in paper_ids if str(value)}):
-        path = root / paper_id / "symbolic_records.runtime.jsonl"
-        if not path.is_file():
-            path = root / paper_id / "symbolic_records.debug.jsonl"
+        paper_root = root / paper_id
+        runtime_path = paper_root / "symbolic_records.runtime.jsonl"
+        debug_path = paper_root / "symbolic_records.debug.jsonl"
+        path = runtime_path if runtime_path.is_file() else debug_path
         if not path.is_file():
             continue
+        debug_by_id: dict[str, dict[str, Any]] = {}
+        if runtime_path.is_file() and debug_path.is_file():
+            for line in debug_path.read_text(encoding="utf-8").splitlines():
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict) and _record_id(row):
+                    debug_by_id[_record_id(row)] = row
         rows: list[dict[str, Any]] = []
         for line in path.read_text(encoding="utf-8").splitlines():
             try:
@@ -117,6 +133,10 @@ def load_processed_records(processed_root: str | Path | None, paper_ids: Iterabl
             except json.JSONDecodeError:
                 continue
             if isinstance(row, dict) and _is_context_candidate(row):
+                debug = debug_by_id.get(_record_id(row)) or {}
+                for key in ("crop_path", "table_crop_path", "figure_crop_path", "equation_algorithm_crop_path", "image_path"):
+                    if debug.get(key):
+                        row[key] = debug[key]
                 rows.append(row)
         result[paper_id] = sorted(rows, key=_record_order)
     return result
@@ -611,9 +631,8 @@ def card_generation_messages(question: str, hierarchy: dict[str, Any], max_claim
     for record in sorted(catalog, key=card_priority):
         limit = 2200 if record.get("source_type") == "table" else 900
         projected = {
-            "evidence_ref": record.get("evidence_ref"), "paper_id": record.get("paper_id"), "page": record.get("page"),
-            "source_type": record.get("source_type"), "label": record.get("label"), "locator": record.get("locator"),
-            "section_path": record.get("section_path"), "text": _clip(record.get("text"), limit),
+            "evidence_ref": record.get("evidence_ref"), "source_type": record.get("source_type"),
+            "label": record.get("label"), "text": _clip(record.get("text"), limit),
         }
         serialized = len(json.dumps(projected, ensure_ascii=False, separators=(",", ":")))
         if compact_l0 and source_chars > 0 and used + serialized > source_chars:
@@ -627,12 +646,9 @@ def card_generation_messages(question: str, hierarchy: dict[str, Any], max_claim
         "l1_contexts": l1,
     }
     system = (
-        "Create grounded evidence cards for scientific QA. Do not answer the question and do not use outside knowledge. "
-        "First list 2-8 atomic query claims. Then create only compact, self-contained propositions directly supported by L0/L1. "
-        "Every card must list support_refs and support_quotes. Each support quote must be an exact contiguous quote copied from the cited L0 record. "
-        "Every value, entity, condition, comparison target, and number in a card must occur in one of its support quotes. "
-        "Use table headers, row labels, units and footnotes when a table value is stated. Never flatten a table into an unsupported claim. "
-        "For figures/equations, preserve their label and refer to their crop or block through the L0 reference. Return JSON only."
+        "Create 2-8 atomic query claims and compact grounded cards; do not answer the question or use outside knowledge. "
+        "Every card fact must occur in an exact contiguous support_quote from its support_ref. Keep table headers, rows, units, and footnotes with each value. "
+        "Return JSON only."
     )
     user = (
         "Return {\"claims\":[{\"claim_id\":\"Q01\",\"claim\":\"...\"}],"

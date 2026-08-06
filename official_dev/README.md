@@ -4,7 +4,7 @@ language:
 - en
 license: cc-by-nc-4.0
 size_categories:
-- n<1K
+- 1K<n<10K
 task_categories:
 - question-answering
 - text-retrieval
@@ -20,7 +20,15 @@ tags:
 - shared-task
 - workshop
 configs:
-- config_name: default
+- config_name: inputs
+  data_files:
+  - split: validation
+    path: data/validation_inputs.jsonl
+  - split: test
+    path: data/test.jsonl
+  - split: test_extra
+    path: data/test_extra.jsonl
+- config_name: validation_gold
   data_files:
   - split: validation
     path: data/validation.jsonl
@@ -28,39 +36,45 @@ configs:
 
 # LitTraceQA
 
-LitTraceQA is a workshop shared-task development set for literature-grounded
-question answering. Systems must retrieve the relevant paper or papers, identify
-coarse evidence locations, and produce the requested answer format.
+LitTraceQA is a workshop shared-task dataset for literature-grounded question
+answering. Systems retrieve the relevant paper or papers and produce the
+requested answer format; the human-verified hidden split additionally evaluates
+coarse evidence locations.
 
-This public split is intentionally small. It is for challenge participants to
-inspect the task format, build loaders, tune prompts, and run local validation
-before submitting to the hidden evaluation set.
+The public repository contains development gold plus input-only online
+evaluation files. Hidden gold labels are kept organizer-side and are evaluated
+through the submission website.
 
 ## Task
 
 Given a research question and requested `answer_types`, return:
 
 1. relevant paper IDs from the released metadata pool;
-2. supporting evidence locations in those papers;
+2. supporting evidence locations when the split evaluates evidence;
 3. the final answer in the requested format.
 
 All questions are scoped to `data/paper_metadata.jsonl`. Submissions should use
 canonical `paper_id` values from that file.
 
-## Public Split
+Released challenge `query_id` values are stable opaque identifiers and do not
+encode source files or generation batches.
+
+## Splits
 
 | Split | Rows | Purpose |
 |---|---:|---|
 | `validation` | 55 | Public development set with gold retrieval, evidence, and answers. |
+| `test` | 71 | Required online leaderboard input split. Gold is hidden; paper, evidence, and answer are evaluated. |
+| `test_extra` | 4,901 | Optional large online evaluation input split. Gold is hidden and not human-verified; paper and answer are evaluated. Results on this split are diagnostic and not required for the main leaderboard. |
 
-Task families:
+Public `validation` task families:
 
 | Family | Count |
 |---|---:|
 | `hidden_source_single_paper` | 26 |
 | `multi_paper` | 29 |
 
-Primary evidence types:
+Public `validation` primary evidence types:
 
 | Type | Count |
 |---|---:|
@@ -74,11 +88,18 @@ Primary evidence types:
 
 ```text
 data/validation.jsonl          # gold development set
-data/validation_inputs.jsonl   # input-only file; table questions include table_schema
-data/sample_submission.jsonl   # empty submission template
+data/validation_inputs.jsonl   # input-only file; MC/table questions include answer schemas
+data/sample_submission.jsonl   # valid placeholder submission template
+data/test.jsonl
+data/test_sample_submission.jsonl
+data/test_extra.jsonl
+data/test_extra_sample_submission.jsonl
 data/paper_metadata.jsonl      # searchable paper metadata pool
 scripts/evaluate.py            # local development evaluator
-schema/littraceqa.schema.json  # machine-readable gold sample schema
+scripts/validate_submission.py # participant output validator
+schema/input.schema.json       # machine-readable input schema
+schema/submission.schema.json  # machine-readable submission schema
+schema/littraceqa.schema.json  # public gold development schema
 ```
 
 Detailed docs:
@@ -88,7 +109,7 @@ Detailed docs:
 
 ## Quick Start
 
-Run the local evaluator on the empty sample submission:
+Run the local evaluator on the placeholder validation submission:
 
 ```bash
 python scripts/evaluate.py \
@@ -100,11 +121,24 @@ For a real run, replace `data/sample_submission.jsonl` with your prediction
 file. See [Data and submission format](docs/format.md) for the expected JSONL
 format.
 
+Validate a completed challenge submission before upload:
+
+```bash
+python scripts/validate_submission.py \
+  --input data/test.jsonl \
+  --pred my_test_predictions.jsonl
+```
+
+For `test_extra`, use `data/test_extra.jsonl`; evidence is optional for that
+split. The validator checks query coverage, answer shape, table columns,
+multiple-choice labels, and paper IDs against the released metadata pool.
+
 ## Intended Use
 
-This public split is for workshop challenge development, prompt engineering,
-loader debugging, and local validation. It should not be treated as the hidden
-test set or as an estimate of final leaderboard performance.
+The `validation` split is for local development, prompt engineering, loader
+debugging, and local validation. The two input-only challenge splits are for
+online submission. The optional unverified split is not used for the required
+leaderboard because its labels have not been manually screened.
 
 ## License Notice
 

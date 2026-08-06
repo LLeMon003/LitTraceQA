@@ -45,6 +45,12 @@ def _args() -> argparse.Namespace:
     parser.add_argument("--page-text-anchors-per-page", type=int, default=0)
     parser.add_argument("--max-context-chars", type=int, default=80000)
     parser.add_argument("--max-packages-per-page", type=int, default=2)
+    parser.add_argument(
+        "--retriever-pool-budget",
+        type=int,
+        default=0,
+        help=">0 restricts selectable records to the hybrid retriever pool (special objects always preserved).",
+    )
     parser.add_argument("--only-query-ids", default="")
     return parser.parse_args()
 
@@ -85,6 +91,39 @@ def _candidate_ids(path: Path) -> dict[str, set[str]]:
         if query_id and paper_id:
             result[query_id].add(paper_id)
     return result
+
+
+def _retriever_pool_record_ids(
+    trace: dict,
+    question: str,
+    processed_root: Path,
+    budget: int,
+) -> set[str]:
+    """Record ids selectable under the hybrid retriever pool for one query."""
+    from .content_retriever import build_retriever_pool, hybrid_retriever_scores
+
+    paper_ids = {str(unit.get("paper_id") or "") for unit in (trace.get("ranked_units") or [])}
+    record_text: dict[str, str] = {}
+    for paper_id in paper_ids:
+        for record in _processed_records(processed_root, paper_id):
+            gid = str(record.get("global_record_id") or record.get("record_id") or "")
+            if gid:
+                record_text[gid] = str(record.get("text") or "")
+    units = [
+        {
+            "unit_type": str(unit.get("unit_type") or ""),
+            "section_id": unit.get("section_id"),
+            "text": " ".join(record_text.get(str(record_id), "") for record_id in (unit.get("record_ids") or [])),
+        }
+        for unit in (trace.get("ranked_units") or [])
+    ]
+    scores = hybrid_retriever_scores(question, units, trace.get("sections"))
+    pool = build_retriever_pool(units, scores, budget)
+    pool_ids: set[str] = set()
+    for index in pool:
+        for record_id in (trace.get("ranked_units") or [])[index].get("record_ids") or []:
+            pool_ids.add(str(record_id))
+    return pool_ids
 
 
 def main() -> int:
@@ -130,6 +169,14 @@ def main() -> int:
                 str(record_id) for record_id in candidate_union.get("qwen_scored_record_ids") or []
                 if str(record_id)
             }
+            if args.retriever_pool_budget > 0 and processed_root is not None:
+                pool_ids = _retriever_pool_record_ids(
+                    trace,
+                    str(sample.get("question") or sample.get("query") or ""),
+                    Path(args.processed_output_dir),
+                    args.retriever_pool_budget,
+                )
+                scored_ids = scored_ids & pool_ids
             if processed_root is not None:
                 records = [
                     record for paper_id in paper_ids

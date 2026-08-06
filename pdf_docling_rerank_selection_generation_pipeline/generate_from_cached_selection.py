@@ -34,6 +34,18 @@ class JSONDraftError(RuntimeError):
 from .symbolic_schema import to_official_source_type
 from .vlm_answer_client import VLMAnswerClient
 from .vlm_answer_prompt_builder import build_symbolic_answer_prompt
+from .slot_generation import (
+    align_composed_values,
+    bind_composition_support,
+    deterministic_count_extraction,
+    ensure_slot_cards,
+    slot_composition_messages,
+    slot_extraction_messages,
+    slot_image_attachments,
+    slot_plan_messages,
+    validate_slot_extraction,
+    validate_slot_plan,
+)
 
 
 def _args() -> argparse.Namespace:
@@ -119,6 +131,12 @@ def _args() -> argparse.Namespace:
         choices=("auto", "true", "false"),
         default="auto",
         help="Run a fail-soft raw-L0 verifier after keyed grounding; auto uses the environment setting.",
+    )
+    parser.add_argument(
+        "--generation-mode",
+        choices=("direct", "slots"),
+        default="direct",
+        help="Use the existing one-pass answer prompt or plan/extract/compose slots from keyed hierarchy cards.",
     )
     parser.add_argument("--dry-run", action="store_true", help="Write the exact packed contexts without calling the answer model.")
     parser.add_argument(
@@ -674,7 +692,12 @@ def _posthoc_ground_keyed_prediction(
             paper_id = str((key_index.get(str(record_keys[0])) or {}).get("paper_id") or "").lower() if record_keys else ""
             source_type = str(metadata.get("source_type") or "")
             proposition = str(metadata.get("proposition") or "").lower()
-            venue_ok = not venue_prefix or paper_id.startswith(venue_prefix)
+            # A venue string inside the question (for example "NAACL 2025"
+            # inside a citation or slot condition) is not proof of the paper's
+            # venue and routinely removed the correct ACL evidence. Paper
+            # identity is already constrained to evidence-bound C-keys, so the
+            # venue heuristic is disabled for keyed grounding.
+            venue_ok = True
             anchor_ok = not (explicit_object_claim and required_anchor_terms and source_type == primary_source_type) or any(term in proposition for term in required_anchor_terms)
             if venue_ok and anchor_ok:
                 allowed.append(str(card_key))
@@ -839,15 +862,79 @@ def _apply_direct_fact_gate(
             if ref and proposition:
                 visual_text_by_ref[ref].append(proposition)
     visual_text = "\n".join(value for ref in refs for value in visual_text_by_ref.get(ref, []))
+    selected_card_keys = {
+        str(card_key)
+        for keys in (internal.get("claim_to_support_keys") or {}).values()
+        if isinstance(keys, list)
+        for card_key in keys
+    }
+    derived_values = {
+        _canonical_fact_text(slot.get("value"))
+        for slot in internal.get("_validated_slots") or []
+        if isinstance(slot, dict)
+        and bool((slot.get("validation") or {}).get("derived_value"))
+        and set(str(key) for key in slot.get("support_keys") or []).intersection(selected_card_keys)
+        and _canonical_fact_text(slot.get("value"))
+    }
+    # Values read from an attached crop (figure/table/equation image) are L0
+    # proof even when the serialized caption does not contain the number.  The
+    # slot extractor already bound them to a crop-backed C-key and validated
+    # them; the grounding gate must not erase them again.
+    visual_slot_values = {
+        _canonical_fact_text(slot.get("value"))
+        for slot in internal.get("_validated_slots") or []
+        if isinstance(slot, dict)
+        and bool((slot.get("validation") or {}).get("visual_supported"))
+        and set(str(key) for key in slot.get("support_keys") or []).intersection(selected_card_keys)
+        and _canonical_fact_text(slot.get("value"))
+    }
+    # Any slot the extractor accepted (status supported) is already bound to
+    # visible C-keys and passed deterministic type/numeric/condition checks.
+    # Its value is a verified extraction, so the freeform/table gate must not
+    # erase it merely because the literal span is absent from serialized text
+    # (list answers, synthesized values, or values read from a crop).
+    slot_supported_values = {
+        _canonical_fact_text(slot.get("value"))
+        for slot in internal.get("_validated_slots") or []
+        if isinstance(slot, dict)
+        and slot.get("status") == "supported"
+        and set(str(key) for key in slot.get("support_keys") or []).intersection(selected_card_keys)
+        and _canonical_fact_text(slot.get("value"))
+    }
+    for slot in internal.get("_validated_slots") or []:
+        if not isinstance(slot, dict) or slot.get("status") != "supported":
+            continue
+        for table_row in slot.get("table_rows") or []:
+            if not isinstance(table_row, dict):
+                continue
+            for cell in (table_row.get("values") or {}).values():
+                canonical_cell = _canonical_fact_text(cell)
+                if canonical_cell:
+                    slot_supported_values.add(canonical_cell)
     answer = internal.get("answer") if isinstance(internal.get("answer"), dict) else {}
     freeform = answer.get("freeform") if isinstance(answer.get("freeform"), dict) else None
     if freeform and str(freeform.get("text") or "").strip():
         value = freeform.get("text")
-        if not _fact_is_directly_supported(value, "\n".join((raw_text, visual_text))):
+        canonical = _canonical_fact_text(value)
+        if (
+            not _fact_is_directly_supported(value, "\n".join((raw_text, visual_text)))
+            and canonical not in derived_values
+            and canonical not in visual_slot_values
+            and canonical not in slot_supported_values
+        ):
             freeform["text"] = ""
             audit.append({"field": "answer.freeform.text", "value": str(value), "status": "unsupported_value_removed"})
         else:
-            audit.append({"field": "answer.freeform.text", "status": "directly_grounded"})
+            audit.append({
+                "field": "answer.freeform.text",
+                "status": "visual_slot_grounded"
+                if canonical in visual_slot_values
+                else "derived_value_grounded"
+                if canonical in derived_values
+                else "slot_supported_grounded"
+                if canonical in slot_supported_values
+                else "directly_grounded",
+            })
 
     cleaned_plan: list[dict[str, Any]] = []
     for item in internal.get("table_answer_plan") or []:
@@ -865,7 +952,12 @@ def _apply_direct_fact_gate(
             # maps it to the trusted candidate title after this gate.
             if str(column).strip().lower() == "paper title" and str(value).strip() == paper_id:
                 return True
-            return _fact_is_directly_supported(value, table_text)
+            return (
+                _fact_is_directly_supported(value, table_text)
+                or _canonical_fact_text(value) in derived_values
+                or _canonical_fact_text(value) in visual_slot_values
+                or _canonical_fact_text(value) in slot_supported_values
+            )
         if nonempty and all(supported_table_value(column, value) for column, value in values.items() if str(value or "").strip()):
             cleaned_plan.append(item)
         else:
@@ -1182,6 +1274,7 @@ def main() -> int:
             "keyed_card_limit": args.keyed_card_limit,
             "max_images": args.max_images,
             "posthoc_refinement": args.posthoc_refinement,
+            "generation_mode": args.generation_mode,
         },
     )
     _write_or_validate_provenance(output, provenance, resume=args.resume)
@@ -1211,6 +1304,9 @@ def main() -> int:
     previews = previous_rows("prompt_previews.jsonl")
     errors = previous_rows("errors.jsonl")
     generation_contexts = previous_rows("generation_selected_contexts.debug.jsonl")
+    slot_plans = previous_rows("slot_plans.jsonl")
+    slot_extractions = previous_rows("slot_extractions.jsonl")
+    slot_validations = previous_rows("slot_validations.jsonl")
     if retry_query_ids:
         def without_retried(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             return [row for row in rows if str(row.get("query_id") or "") not in retry_query_ids]
@@ -1222,6 +1318,9 @@ def main() -> int:
         previews = without_retried(previews)
         errors = without_retried(errors)
         generation_contexts = without_retried(generation_contexts)
+        slot_plans = without_retried(slot_plans)
+        slot_extractions = without_retried(slot_extractions)
+        slot_validations = without_retried(slot_validations)
     completed_query_ids = {str(row.get("query_id") or "") for row in predictions if row.get("query_id")}
 
     def checkpoint() -> None:
@@ -1232,6 +1331,9 @@ def main() -> int:
         write_jsonl(output / "generation_recoveries.jsonl", recoveries)
         write_jsonl(output / "prompt_previews.jsonl", previews)
         write_jsonl(output / "generation_selected_contexts.debug.jsonl", generation_contexts)
+        write_jsonl(output / "slot_plans.jsonl", slot_plans)
+        write_jsonl(output / "slot_extractions.jsonl", slot_extractions)
+        write_jsonl(output / "slot_validations.jsonl", slot_validations)
         write_jsonl(output / "errors.jsonl", errors)
 
     for query_id, sample in inputs.items():
@@ -1264,6 +1366,7 @@ def main() -> int:
             else args.posthoc_refinement == "true"
         )
         pre_prompt_count = len(evidence)
+        slot_hierarchy: dict[str, Any] | None = None
         if hierarchy:
             hierarchy = copy.deepcopy(hierarchy)
             # Table-derived facts commonly answer freeform/MC questions. Keep
@@ -1311,10 +1414,17 @@ def main() -> int:
                 hierarchy["keyed_table_view_limit"] = max(0, args.keyed_table_view_limit)
             if args.keyed_table_view_rows is not None:
                 hierarchy["keyed_table_view_rows"] = max(1, args.keyed_table_view_rows)
+            if args.generation_mode == "slots" and args.hierarchy_prompt_mode == "keyed":
+                slot_hierarchy = ensure_slot_cards(copy.deepcopy(hierarchy))
             hierarchy, evidence, selected_context, messages = _fit_hierarchy_to_prompt(
                 sample, candidates, evidence, hierarchy, config, contract, args.max_prompt_chars,
                 max_images=max_images, keyed_mode=args.hierarchy_prompt_mode == "keyed",
             )
+            if slot_hierarchy is not None:
+                # Prompt fitting controls the legacy preview only. Slot calls
+                # read from the full frozen L0 reservoir through C-keys.
+                hierarchy = slot_hierarchy
+                evidence = [dict(row) for row in hierarchy.get("l0_catalog") or [] if isinstance(row, dict)]
         else:
             evidence, messages = _fit_coverage_to_prompt(
                 sample, candidates, evidence, config, contract, args.max_prompt_chars,
@@ -1325,7 +1435,7 @@ def main() -> int:
             "query_id": query_id,
             "pre_prompt_evidence_count": pre_prompt_count,
             "selected_evidence_count": len(evidence),
-            "hierarchy_card_count": len((hierarchy or {}).get("l2_evidence_cards") or []),
+                "hierarchy_card_count": len((hierarchy or {}).get("l2_evidence_cards") or []),
             "prompt_chars": prompt_chars,
             "messages": messages,
         })
@@ -1334,35 +1444,125 @@ def main() -> int:
             continue
         try:
             image_paths = selected_context.get("attached_image_paths") if config.vlm2_context_mode == "cropped_image" else None
-            try:
-                internal, _result, raw_attempts = _generate_json_draft(
-                    client,
-                    messages,
-                    image_paths=image_paths,
-                    parse_retries=config.generation_parse_max_retries,
+            if args.generation_mode == "slots":
+                if not hierarchy or args.hierarchy_prompt_mode != "keyed":
+                    raise ValueError("--generation-mode slots requires --hierarchy-input and --hierarchy-prompt-mode keyed")
+                raw_plan, _result, raw_attempts = _generate_json_draft(
+                    client, slot_plan_messages(sample, contract), None,
+                    config.generation_parse_max_retries,
                 )
-                raw_rows.extend({"query_id": query_id, "phase": "primary", **attempt} for attempt in raw_attempts)
-            except Exception as image_error:
-                # A vision endpoint may return a non-JSON response or reject a
-                # multimodal request even though the text-only endpoint is
-                # healthy.  Preserve the failed response where available and
-                # recover with the identical keyed L2 prompt minus attachments.
-                # This never changes selection membership or exposes L0 data.
-                if not image_paths:
-                    raise
-                if isinstance(image_error, JSONDraftError):
-                    raw_rows.extend({"query_id": query_id, "phase": "cropped_image_parse_failure", **attempt} for attempt in image_error.raw_attempts)
-                recoveries.append({"query_id": query_id, "type": "cropped_image_text_only_recovery", "error": str(image_error)})
+                raw_rows.extend({"query_id": query_id, "phase": "slot_plan", **attempt} for attempt in raw_attempts)
+                plan, plan_audit = validate_slot_plan(raw_plan, sample, candidates)
+                slot_plans.append({"query_id": query_id, "plan": plan, "audit": plan_audit})
+                extracted_slots: list[dict[str, Any]] = []
+                for slot in plan["slots"]:
+                    if slot.get("operation") in ("count", "direct"):
+                        deterministic = deterministic_count_extraction(
+                            slot, hierarchy, str(sample.get("question") or ""), candidates
+                        )
+                        if deterministic is not None:
+                            extracted = deterministic
+                            extraction_audit = [{
+                                "slot_id": slot["id"],
+                                "status": "slot_supported_deterministic",
+                                "value": extracted.get("value"),
+                            }]
+                            raw_rows.append({
+                                "query_id": query_id, "phase": f"slot_extract:{slot['id']}",
+                                "parse_attempt": 0, "content": "deterministic_count", "raw_response": {},
+                            })
+                            extracted_slots.append(extracted)
+                            slot_extractions.append({"query_id": query_id, "slot": slot, "extraction": extracted})
+                            slot_validations.append({"query_id": query_id, "slot_id": slot["id"], "audit": extraction_audit})
+                            continue
+                    slot_attachments = (
+                        slot_image_attachments(sample, slot, hierarchy, candidates, max_images=max_images)
+                        if config.vlm2_context_mode == "cropped_image" else None
+                    )
+                    slot_images = [str(row["path"]) for row in slot_attachments or []]
+                    table_schema = (contract.get("table") or {}).get("table_schema")
+                    extracted = None
+                    extraction_audit: list[dict[str, Any]] = []
+                    for card_limit in (24, 48):
+                        raw_slot, _result, raw_attempts = _generate_json_draft(
+                            client,
+                            slot_extraction_messages(
+                                sample, slot, hierarchy, candidates, slot_attachments,
+                                table_schema=table_schema, card_limit=card_limit,
+                            ),
+                            slot_images,
+                            config.generation_parse_max_retries,
+                        )
+                        raw_rows.extend({"query_id": query_id, "phase": f"slot_extract:{slot['id']}", **attempt} for attempt in raw_attempts)
+                        extracted, extraction_audit = validate_slot_extraction(
+                            raw_slot, slot, hierarchy, table_schema=table_schema
+                        )
+                        if extracted["status"] == "supported" or card_limit == 48:
+                            break
+                        errors.append({
+                            "query_id": query_id,
+                            "type": "slot_extraction_retry_expanded_packet",
+                            "slot_id": slot["id"],
+                            "first_status": extracted["status"],
+                            "card_limit": card_limit,
+                        })
+                    extracted_slots.append(extracted)
+                    slot_extractions.append({"query_id": query_id, "slot": slot, "extraction": extracted})
+                    slot_validations.append({"query_id": query_id, "slot_id": slot["id"], "audit": extraction_audit})
                 internal, _result, raw_attempts = _generate_json_draft(
-                    client,
-                    messages,
-                    image_paths=None,
-                    parse_retries=config.generation_parse_max_retries,
+                    client, slot_composition_messages(sample, candidates, contract, extracted_slots), None,
+                    config.generation_parse_max_retries,
                 )
-                raw_rows.extend({"query_id": query_id, "phase": "text_only_recovery", **attempt} for attempt in raw_attempts)
+                raw_rows.extend({"query_id": query_id, "phase": "slot_compose", **attempt} for attempt in raw_attempts)
+                internal, composition_audit = bind_composition_support(internal, extracted_slots)
+                internal, format_audit = align_composed_values(internal, sample, extracted_slots)
+                deterministic_table_plan: list[dict[str, Any]] = []
+                for validated in extracted_slots:
+                    if validated.get("status") != "supported":
+                        continue
+                    for table_row in validated.get("table_rows") or []:
+                        row_keys = [str(key) for key in table_row.get("support_keys") or []]
+                        if row_keys:
+                            deterministic_table_plan.append({
+                                "row_support_key": row_keys[0],
+                                "values": dict(table_row.get("values") or {}),
+                                "slot_id": validated.get("slot_id"),
+                            })
+                if deterministic_table_plan:
+                    internal["table_answer_plan"] = deterministic_table_plan
+                    format_audit.append({"status": "table_rows_filled_from_validated_slots", "row_count": len(deterministic_table_plan)})
+                internal["_validated_slots"] = extracted_slots
+                slot_validations.append({"query_id": query_id, "slot_id": "composition", "audit": [*composition_audit, *format_audit]})
+            else:
+                try:
+                    internal, _result, raw_attempts = _generate_json_draft(
+                        client,
+                        messages,
+                        image_paths=image_paths,
+                        parse_retries=config.generation_parse_max_retries,
+                    )
+                    raw_rows.extend({"query_id": query_id, "phase": "primary", **attempt} for attempt in raw_attempts)
+                except Exception as image_error:
+                    # A vision endpoint may return a non-JSON response or reject a
+                    # multimodal request even though the text-only endpoint is
+                    # healthy. Preserve the failed response where available and
+                    # recover with the identical keyed L2 prompt minus attachments.
+                    # This never changes selection membership or exposes L0 data.
+                    if not image_paths:
+                        raise
+                    if isinstance(image_error, JSONDraftError):
+                        raw_rows.extend({"query_id": query_id, "phase": "cropped_image_parse_failure", **attempt} for attempt in image_error.raw_attempts)
+                    recoveries.append({"query_id": query_id, "type": "cropped_image_text_only_recovery", "error": str(image_error)})
+                    internal, _result, raw_attempts = _generate_json_draft(
+                        client,
+                        messages,
+                        image_paths=None,
+                        parse_retries=config.generation_parse_max_retries,
+                    )
+                    raw_rows.extend({"query_id": query_id, "phase": "text_only_recovery", **attempt} for attempt in raw_attempts)
             if hierarchy and args.hierarchy_prompt_mode == "keyed":
                 internal, grounding_audit = _posthoc_ground_keyed_prediction(internal, hierarchy)
-                if refinement_enabled:
+                if refinement_enabled and args.generation_mode == "direct":
                     try:
                         internal, refinement = _refine_keyed_draft(client, sample, candidates, contract, internal, hierarchy)
                         if refinement is not None:

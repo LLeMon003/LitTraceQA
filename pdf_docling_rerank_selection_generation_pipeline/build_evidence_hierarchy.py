@@ -51,9 +51,18 @@ def main() -> int:
     mode = args.mode or config.evidence_hierarchy_card_mode
     only = {part.strip() for part in args.only_query_ids.split(",") if part.strip()}
     inputs = {str(row.get("query_id") or ""): row for row in read_jsonl(find_official_file(args.official_dir, "validation_inputs.jsonl"))}
-    selections = {str(row.get("query_id") or ""): row for row in read_jsonl(args.selected_contexts_input)}
+    selections = {
+        query_id: row
+        for row in read_jsonl(args.selected_contexts_input)
+        if (query_id := str(row.get("query_id") or "")) and (not only or query_id in only)
+    }
     candidates_by_query = _candidate_map(args.candidate_papers_input)
-    paper_ids = {str(record.get("paper_id") or "") for row in selections.values() for record in row.get("selected_records") or [] if isinstance(record, dict)}
+    paper_ids = {
+        str(record.get("paper_id") or "")
+        for row in selections.values()
+        for record in row.get("selected_records") or []
+        if isinstance(record, dict)
+    }
     processed_records = load_processed_records(args.processed_output_dir, paper_ids)
     client = VLMAnswerClient(config)
     output = Path(args.output_dir)

@@ -123,6 +123,14 @@ def _read_jsonl_if_exists(path: Path) -> list[dict[str, Any]]:
     return read_jsonl(path) if path.exists() else []
 
 
+def _completed_query_ids(predictions_path: Path) -> set[str]:
+    return {
+        str(row.get("query_id") or "")
+        for row in _read_jsonl_if_exists(predictions_path)
+        if row.get("query_id")
+    }
+
+
 def _load_reused_candidates(path: str | Path) -> dict[str, list[dict[str, Any]]]:
     """Load the flat candidate artifact written by this baseline, grouped by query."""
     source = Path(path)
@@ -162,7 +170,7 @@ def _remove_query_rows(paths: dict[str, Path], query_ids: set[str], show_progres
     query_scoped_paths = {
         key: path
         for key, path in paths.items()
-        if key not in {"symbolic_records_runtime", "symbolic_records_debug", "pdf_extraction_artifacts"}
+        if key not in {"symbolic_records_runtime", "symbolic_records_debug"}
     }
     for key, path in query_scoped_paths.items():
         if path.suffix != ".jsonl" or not path.exists():
@@ -362,6 +370,7 @@ def main() -> int:
     paths = _paths(output_dir, args.resume)
     if args.replace_query_results:
         _remove_query_rows(paths, only_ids, args.show_progress)
+    completed_query_ids = _completed_query_ids(paths["predictions"]) if args.resume else set()
     processed_root = Path(args.processed_output_dir)
     structured_root = processed_root / transcription_backend
     inputs = read_jsonl(find_official_file(args.official_dir, "validation_inputs.jsonl"))
@@ -440,6 +449,12 @@ def main() -> int:
             query_started = time.monotonic()
             query_id = str(sample.get("query_id") or "")
             question = str(sample.get("question") or "")
+            if query_id in completed_query_ids:
+                _progress(
+                    args.show_progress,
+                    f"{_progress_bar(query_index, total_queries)} {query_id} skip status=resume_existing_prediction",
+                )
+                continue
             answer_contract = extract_answer_contract(sample, validation_by_id.get(query_id))
             top_k_papers = _top_k_for_sample(sample, config, args.top_k_papers)
             task_family = str(sample.get("task_family") or "")
@@ -637,6 +652,7 @@ def main() -> int:
                     llmrerank_instruction_version=config.llmrerank_instruction_version,
                     llmrerank_query_mode=config.llmrerank_query_mode,
                     llmrerank_include_paper_identity=config.llmrerank_include_paper_identity,
+                    retriever_pool_budget=config.retriever_pool_budget,
                 ),
                 multi_paper_hyde_config=MultiPaperHyDEConfig(
                     enabled=config.multi_paper_hyde_enabled,

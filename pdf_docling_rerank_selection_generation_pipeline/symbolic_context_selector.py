@@ -7,8 +7,8 @@ from typing import Any
 
 from .metadata_index import BM25Okapi, tokenize
 from .evidence_packages import EvidencePackageConfig, build_packages, select_packages
-from .multi_paper_hyde import MultiPaperHyDEConfig, generate_claims
-from .paper_conditioned_claims import PaperConditionedClaimsConfig, generate_paper_conditioned_claims
+from .multi_paper_hyde import MultiPaperHyDEConfig
+from .paper_conditioned_claims import PaperConditionedClaimsConfig, generate_evidence_plan
 from .section_relevance import SectionRelevanceConfig, query_for_relevance_mode, retrieve_section_relevance
 from .symbolic_schema import (
     HEADER_FOOTER_RECORD_TYPES,
@@ -700,39 +700,17 @@ def select_symbolic_contexts(
             primary_evidence_type=primary_evidence_type,
             candidate_paper_metadata=candidate_paper_metadata,
         )
-        hyde_config = multi_paper_hyde_config or MultiPaperHyDEConfig()
         route_queries: list[str] = []
         if paper_local_bm25_route_mode not in {"disabled", "original", "mask_method_aliases"}:
             raise ValueError("Unsupported PAPER_LOCAL_BM25_ROUTE_MODE.")
         paper_route_queries: list[tuple[str, str]] = []
         paper_local_route_queries: list[tuple[str, str]] = []
-        hyde_audit: dict[str, Any] = {"enabled": False, "mode": "routing_only"}
-        if is_multi_paper_task and hyde_config.enabled:
-            try:
-                _, claims, warnings, cache_hit = generate_claims(
-                    query_id=query_id,
-                    query=query,
-                    primary_evidence_type=primary_evidence_type,
-                    candidate_papers=sorted({str(record.get("paper_id") or "") for record in valid}),
-                    config=hyde_config,
-                    client=hyde_client,
-                    cache_root=Path(processed_root) / ".multi_paper_hyde_cache",
-                )
-                route_queries = [str(claim["hypothetical_evidence"]) for claim in claims]
-                hyde_audit = {
-                    "enabled": True,
-                    "mode": "routing_only",
-                    "claim_count": len(route_queries),
-                    "cache_hit": cache_hit,
-                    "warnings": warnings,
-                }
-            except Exception as exc:
-                hyde_audit = {"enabled": True, "mode": "routing_only", "fallback": str(exc)}
+        hyde_audit: dict[str, Any] = {"enabled": False, "replaced_by": "evidence_planning"}
         paper_claim_config = paper_conditioned_claims_config or PaperConditionedClaimsConfig()
-        paper_claim_audit: dict[str, Any] = {"enabled": False}
+        paper_claim_audit: dict[str, Any] = {"enabled": False, "mode": "evidence_planning"}
         if is_multi_paper_task and paper_claim_config.enabled:
             try:
-                claims, warnings, cache_hit = generate_paper_conditioned_claims(
+                plan, warnings, cache_hit = generate_evidence_plan(
                     query_id=query_id,
                     query=query,
                     primary_evidence_type=primary_evidence_type,
@@ -741,10 +719,20 @@ def select_symbolic_contexts(
                     client=hyde_client,
                     cache_root=Path(processed_root) / ".multi_paper_hyde_cache",
                 )
-                paper_route_queries = [(claim["paper_id"], claim["hypothetical_evidence"]) for claim in claims]
-                paper_claim_audit = {"enabled": True, "claim_count": len(claims), "cache_hit": cache_hit, "warnings": warnings}
+                paper_route_queries = [
+                    (item["paper_id"], " ".join([*item["source_types"], item["retrieval_query"]]).strip())
+                    for item in plan["plans"]
+                ]
+                paper_claim_audit = {
+                    "enabled": True,
+                    "mode": "evidence_planning",
+                    "cross_paper": plan["cross_paper"],
+                    "plan_count": len(plan["plans"]),
+                    "cache_hit": cache_hit,
+                    "warnings": warnings,
+                }
             except Exception as exc:
-                paper_claim_audit = {"enabled": True, "fallback": str(exc)}
+                paper_claim_audit = {"enabled": True, "mode": "evidence_planning", "fallback": str(exc)}
         paper_local_bm25_audit: dict[str, Any] = {"enabled": False}
         if is_multi_paper_task and paper_local_bm25_route_mode != "disabled":
             route_query = query_for_relevance_mode(query, paper_local_bm25_route_mode)

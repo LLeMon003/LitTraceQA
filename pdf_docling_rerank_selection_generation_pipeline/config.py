@@ -123,6 +123,7 @@ class PipelineConfig:
     llmrerank_instruction_version: str
     llmrerank_query_mode: str
     llmrerank_include_paper_identity: bool
+    retriever_pool_budget: int
     multi_paper_hyde_enabled: bool
     multi_paper_hyde_model: str
     multi_paper_hyde_max_claims: int
@@ -323,6 +324,7 @@ def load_pipeline_config(env_path: str | Path = ".env") -> PipelineConfig:
         llmrerank_instruction_version=get("LLMRERANK_INSTRUCTION_VERSION", "v1") or "v1",
         llmrerank_query_mode=get("LLMRERANK_QUERY_MODE", "original") or "original",
         llmrerank_include_paper_identity=get_bool("LLMRERANK_INCLUDE_PAPER_IDENTITY", False),
+        retriever_pool_budget=int(get("RETRIEVER_POOL_BUDGET", "0") or "0"),
         multi_paper_hyde_enabled=get_bool("MULTI_PAPER_HYDE_ENABLED", False),
         multi_paper_hyde_model=get("MULTI_PAPER_HYDE_MODEL", "deepseek-ai/DeepSeek-V4-Flash") or "deepseek-ai/DeepSeek-V4-Flash",
         multi_paper_hyde_max_claims=int(get("MULTI_PAPER_HYDE_MAX_CLAIMS", "4") or "4"),

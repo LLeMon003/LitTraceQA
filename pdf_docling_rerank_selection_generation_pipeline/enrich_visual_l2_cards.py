@@ -85,18 +85,12 @@ def select_visual_candidates(hierarchy: dict[str, Any], max_per_query: int, max_
 
 def _observation_messages(question: str, record: dict[str, Any]) -> list[dict[str, str]]:
     payload = {
-        "question": question,
-        "evidence_ref": record.get("evidence_ref"),
-        "paper_id": record.get("paper_id"),
-        "page": record.get("page"),
         "object_label": record.get("label"),
         "caption_hint": _clip(record.get("text"), 420),
     }
     system = (
-        "You create a compact evidence card from one scientific figure crop. Do not answer the question and do not use outside knowledge. "
-        "State only literal visible strings and unambiguous visual relationships, including labels, method names, numeric values, legend relationships, or explicit diagram text. "
-        "Do not infer purpose, performance, comparisons, causality, or a method's properties unless words or arrows in the crop explicitly state them. "
-        "Use the caption hint only to disambiguate visible text; do not infer facts absent from the crop. Return JSON only."
+        "Create one compact literal observation from this figure crop. Use visible text and unambiguous relationships only; "
+        "do not infer purpose, performance, comparison, causality, or properties. The caption only disambiguates visible text. Return JSON only."
     )
     user = (
         "Return {\"proposition\":\"one <=320-character literal visual observation\",\"visible_strings\":[\"exact text visibly present\"],"
@@ -108,7 +102,6 @@ def _observation_messages(question: str, record: dict[str, Any]) -> list[dict[st
 
 def _verification_messages(question: str, record: dict[str, Any], observation: dict[str, Any]) -> list[dict[str, str]]:
     payload = {
-        "evidence_ref": record.get("evidence_ref"),
         "proposition": _clip(observation.get("proposition"), 360),
         "visible_strings": observation.get("visible_strings") or [],
         "entities": observation.get("entities") or [],
@@ -116,8 +109,7 @@ def _verification_messages(question: str, record: dict[str, Any], observation: d
         "conditions": observation.get("conditions") or [],
     }
     system = (
-        "You verify a proposed factual observation against one scientific figure crop. Approve only if every stated entity, number, relation, "
-        "and condition is directly visible in the crop. Relevance to the user question is not a criterion: reject only for a visual grounding error. "
+        "Approve only when every stated entity, number, relation, and condition is directly visible in this crop. "
         "Do not use outside knowledge or infer missing text. Return JSON only."
     )
     user = "Return {\"supported\":true|false,\"reason\":\"brief\"}.\nINPUT:" + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))

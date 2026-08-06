@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://huggingface.co/datasets/LitTraceQA/LitTraceQA/resolve/main/schema/input.schema.json",
+  "title": "LitTraceQA participant input record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["query_id", "benchmark", "question", "answer_types"],
+  "properties": {
+    "query_id": {"type": "string", "minLength": 1},
+    "benchmark": {"const": "LitTraceQA"},
+    "question": {"type": "string", "minLength": 1},
+    "answer_types": {
+      "type": "array",
+      "minItems": 1,
+      "uniqueItems": true,
+      "items": {"enum": ["freeform", "multiple_choice", "table"]}
+    },
+    "multiple_choice_options": {
+      "type": "array",
+      "minItems": 2,
+      "items": {"$ref": "#/$defs/multiple_choice_option"}
+    },
+    "table_schema": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/table_column"}
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "answer_types": {"contains": {"const": "multiple_choice"}}
+        },
+        "required": ["answer_types"]
+      },
+      "then": {"required": ["multiple_choice_options"]},
+      "else": {"not": {"required": ["multiple_choice_options"]}}
+    },
+    {
+      "if": {
+        "properties": {
+          "answer_types": {"contains": {"const": "table"}}
+        },
+        "required": ["answer_types"]
+      },
+      "then": {"required": ["table_schema"]},
+      "else": {"not": {"required": ["table_schema"]}}
+    }
+  ],
+  "$defs": {
+    "multiple_choice_option": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["label", "text"],
+      "properties": {
+        "label": {"type": "string", "pattern": "^[A-Z]$"},
+        "text": {"type": "string", "minLength": 1}
+      }
+    },
+    "table_column": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "type", "is_row_key"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "type": {"enum": ["string", "number", "boolean"]},
+        "is_row_key": {"type": "boolean"}
+      }
+    }
+  }
+}

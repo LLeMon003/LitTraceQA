@@ -41,5 +41,6 @@ def test_multi_paper_ledger_protocol_has_bounded_nonduplicated_evidence() -> Non
     )
     prompt = messages[-1]["content"]
     assert '"evidence_output_limit":16' in prompt
-    assert "Do not add supporting_evidence or contribution fields" in prompt
+    assert "contributing_papers" in prompt
+    assert '"query_id"' not in prompt
     assert '"evidence_refs"' in prompt

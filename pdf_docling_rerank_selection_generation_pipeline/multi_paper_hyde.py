@@ -11,7 +11,7 @@ from typing import Any
 from .symbolic_schema import OFFICIAL_EVIDENCE_SOURCE_TYPES
 
 
-PROMPT_VERSION = "v1_value_masked_claims"
+PROMPT_VERSION = "v2_compact_value_masked_claims"
 SCHEMA_VERSION = "v1"
 ALLOWED_SOURCE_TYPES = set(OFFICIAL_EVIDENCE_SOURCE_TYPES)
 PLACEHOLDER_RE = re.compile(r"\[[A-Z][A-Z0-9_ -]{1,40}\]")
@@ -83,10 +83,8 @@ def validate_claims(raw: str, max_claims: int) -> tuple[list[dict[str, Any]], li
 def _prompt(query: str, primary_evidence_type: str | None, max_claims: int) -> list[dict[str, str]]:
     return [
         {"role": "system", "content": (
-            "Generate answer-agnostic hypothetical scientific evidence claims for lexical retrieval routing. Return JSON only. "
-            "Preserve every condition, comparison, and paper scope. Mask every unknown answer with [VALUE], [METHOD], "
-            "[DATASET], [METRIC], or [PAPER]. Do not guess facts, paper names, section names, or object labels. "
-            "expected_source_types may contain text_span, citation_context, table, figure, equation_algorithm."
+            "Generate answer-agnostic claims for lexical routing. Preserve conditions, comparisons, and paper scope; "
+            "mask unknowns as [VALUE], [METHOD], [DATASET], [METRIC], or [PAPER]. Do not invent facts or names. Return JSON only."
         )},
         {"role": "user", "content": f"Question: {query}\nPrimary evidence hint: {primary_evidence_type or 'unknown'}\n"
          f"Generate at most {max_claims} claims as {{\"claims\":[{{\"hypothetical_evidence\":\"... [VALUE].\",\"expected_source_types\":[\"text_span\"]}}]}}."},

@@ -293,9 +293,12 @@ class PromptGroundingTests(unittest.TestCase):
         grounded, audit = _posthoc_ground_keyed_prediction(
             {"claim_to_support_keys": {"Q01": ["C001", "C002", "C003"]}, "answer": {"freeform": {"text": ""}}}, hierarchy
         )
-        self.assertEqual(grounded["evidence_refs"], ["E0001"])
-        self.assertEqual(grounded["claim_to_support_keys"], {"Q01": ["C001"]})
-        self.assertEqual(sum(row.get("status") == "claim_key_constraint_removed" for row in audit), 2)
+        # A venue string in the question is not proof of the paper's venue
+        # (q_020 evidence removed the correct ACL paper); only the explicit
+        # object-anchor constraint filters impossible cards.
+        self.assertEqual(grounded["evidence_refs"], ["E0001", "E0002"])
+        self.assertEqual(grounded["claim_to_support_keys"], {"Q01": ["C001", "C002"]})
+        self.assertEqual(sum(row.get("status") == "claim_key_constraint_removed" for row in audit), 1)
 
     def test_answer_client_attaches_real_image(self):
         config = SimpleNamespace(answer_api_key="test-key-123456", answer_model="Qwen3-VL")
@@ -332,6 +335,7 @@ class PromptGroundingTests(unittest.TestCase):
         messages = build_symbolic_answer_prompt(sample, [{"paper_id": "paper", "title": "Hidden title"}], {"evidence_hierarchy": hierarchy}, answer_contract={"answer_types": ["freeform"]})
         self.assertNotIn("_card_metadata", messages[-1]["content"])
         self.assertNotIn("visual_verified", messages[-1]["content"])
+        self.assertNotIn('"query_id"', messages[-1]["content"])
 
     def test_zero_micro_index_uses_final_prompt_ceiling_not_legacy_cap(self):
         import inspect

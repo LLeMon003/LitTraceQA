@@ -69,7 +69,6 @@ def project_metadata_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
 
 def build_metadata_selection_messages(sample: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
     payload = {
-        "query_id": sample.get("query_id"),
         "task_family": sample.get("task_family"),
         "primary_evidence_type": sample.get("primary_evidence_type"),
         "question": sample.get("question"),
@@ -77,23 +76,14 @@ def build_metadata_selection_messages(sample: dict[str, Any], candidates: list[d
         "candidate_papers": [project_metadata_candidate(candidate) for candidate in candidates],
     }
     system = (
-        "You are a LitTraceQA metadata-only paper selection model. "
-        "Select the paper_id values from candidate_papers that are relevant to the question using only candidate metadata and retrieval annotations. "
-        "Do not answer the question. Do not provide evidence. Output valid JSON only."
+        "Select relevant candidate paper_id values using only INPUT metadata. Do not answer the question or provide evidence. Return JSON only."
     )
     user = (
-        "Select relevant papers from candidate_papers.\n\n"
-        "Rules:\n"
-        "1. Output JSON only.\n"
-        "2. query_id must match input.\n"
-        "3. gold_papers must contain only paper_id values present in candidate_papers.\n"
-        "4. For hidden_source_single_paper or other single-paper tasks, prefer exactly one best paper.\n"
-        "5. For multi_paper tasks, include all and only papers that match the query topic; avoid broad topical neighbors.\n"
-        "6. If candidate_papers include selection_prior=topic_profile_candidate, treat those as explicit topic-profile annotations for this query. Prefer selecting within that set; select non-topic retrieval_candidate papers only when the topic-profile set is clearly incomplete.\n"
-        "7. Do not output answer, evidence, confidence, scores, explanations, or markdown.\n\n"
+        "For single-paper tasks choose one best paper; for multi-paper tasks choose all and only topical papers. "
+        "Prefer topic_profile_candidate papers unless that set is clearly incomplete. Use only supplied paper IDs.\n"
         f"INPUT:\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n\n"
         "TARGET_JSON_SHAPE:\n"
-        '{\n  "query_id": "<same query id>",\n  "gold_papers": [{"paper_id": "<candidate paper id>"}]\n}'
+        '{"gold_papers":[{"paper_id":"<candidate paper id>"}]}'
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 

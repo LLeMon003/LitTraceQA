@@ -37,15 +37,17 @@ Each question receives precision/recall/F1, then scores are macro-averaged.
 
 ## Evidence Grounding
 
-Evidence is evaluated by coarse exact match. Each evidence item is normalized to:
+Evidence is evaluated by coarse exact match. Each evidence item is normalized
+to:
 
 ```text
-(paper_id, source_type, page, object_id)
+(paper_id, source_type, page_or_section, object_id)
 ```
 
-`object_id` is `table_id` for table evidence, `figure_id` for figure evidence,
-and empty for other evidence types. Fine-grained fields such as `row`,
-`column`, `region`, or `section` are ignored by the public evaluator.
+`object_id` is `table_id`, `figure_id`, `equation_id`/`algorithm_id`, or
+`citation_id` as appropriate. Page is preferred; section is used only when page
+is unavailable. Fine-grained fields such as `row`, `column`, and `region` are
+ignored by the public evaluator.
 
 Reported metrics:
 
@@ -75,3 +77,22 @@ alignment.
 
 The hidden test evaluation may include additional organizer-side checks, but it
 will use the same high-level output components.
+
+## Online Challenge Splits
+
+The online submission website evaluates two input-only splits:
+
+| Split | Required? | Evaluated components |
+|---|---:|---|
+| `test` | Yes | paper retrieval, evidence grounding, final answer |
+| `test_extra` | No | paper retrieval, final answer |
+
+`test` is manually approved by human auditors and is used for
+the required leaderboard. `test_extra` is a larger diagnostic
+split whose labels have not been manually screened; results on it may be shown
+for reference, but participants are not required to submit this split for the
+main leaderboard.
+
+Hidden gold labels are not distributed in this dataset. The submission website
+should report aggregate metrics only and should not reveal per-question
+correctness, gold papers, evidence, or answers.

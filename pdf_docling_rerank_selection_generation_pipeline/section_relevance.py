@@ -48,12 +48,18 @@ INSTRUCTIONS = {
         "the unit's concrete factual support for the requested topic. Use section metadata only as location context, "
         "not as proof. Consider text, object labels, tables, figures, equations, citations, images, and nearby records."
     ),
+    "v4_complete_support_minimal": (
+        "Rank each scientific-paper unit by its usefulness as evidence for answering the query. "
+        "Include direct answers and necessary supporting facts. For comparisons, relevant evidence may describe "
+        "an unnamed baseline. Use only the unit; section metadata is context, not evidence."
+    ),
 }
 
 
 @dataclass(frozen=True)
 class SectionRelevanceConfig:
     backend: str = "bm25"
+    retriever_pool_budget: int = 0
     unit_mode: str = "record_aware"
     unit_target_tokens: int = 1280
     unit_max_tokens: int = 1536
@@ -487,17 +493,41 @@ def retrieve_section_relevance(query: str, candidate_records: list[dict[str, Any
             unit["artifact_fingerprint"] = section["artifact_fingerprint"]
         section["chunks"] = section_units
         units.extend(section_units)
+    retriever_pool: set[int] | None = None
+    if config.retriever_pool_budget > 0:
+        from .content_retriever import build_retriever_pool, hybrid_retriever_scores
+
+        retriever_pool = build_retriever_pool(
+            units,
+            hybrid_retriever_scores(query, units, sections),
+            config.retriever_pool_budget,
+        )
     bm25_raw = [float(value) for value in BM25Okapi([tokenize(unit["text"]) for unit in units]).get_scores(tokenize(query))] if units else []
     qwen_raw: list[float | None] = [None] * len(units)
     calls: list[dict[str, Any]] = [{} for _ in units]
     stats: dict[str, Any] = {}
     scoring_query = query_for_relevance_mode(query, config.llmrerank_query_mode)
     if config.backend == "llmrerank":
-        qwen_raw, calls, stats = _qwen_scores(scoring_query, units, config, Path(processed_root))
+        if retriever_pool is not None:
+            ordered = sorted(retriever_pool)
+            pool_scores, pool_calls, pool_stats = _qwen_scores(
+                scoring_query, [units[index] for index in ordered], config, Path(processed_root)
+            )
+            for local_index, global_index in enumerate(ordered):
+                qwen_raw[global_index] = pool_scores[local_index]
+                calls[global_index] = pool_calls[local_index]
+            stats = dict(pool_stats)
+            stats["retriever_pool_budget"] = config.retriever_pool_budget
+            stats["retriever_pool_unit_count"] = len(ordered)
+            stats["retriever_excluded_unit_count"] = len(units) - len(ordered)
+        else:
+            qwen_raw, calls, stats = _qwen_scores(scoring_query, units, config, Path(processed_root))
     bm25_norm = _normalize(bm25_raw)
     qwen_norm = _normalize(qwen_raw)
     for index, unit in enumerate(units):
-        if config.backend == "llmrerank" and qwen_norm[index] is not None:
+        if retriever_pool is not None and index not in retriever_pool:
+            score, raw, backend = -1.0, bm25_raw[index], "retriever_excluded"
+        elif config.backend == "llmrerank" and qwen_norm[index] is not None:
             score, raw, backend = float(qwen_norm[index]), float(qwen_raw[index]), "llmrerank"
         elif config.backend == "llmrerank" and config.llmrerank_failure_fallback == "bm25":
             score, raw, backend = float(bm25_norm[index] or 0.0), bm25_raw[index], "bm25_fallback"

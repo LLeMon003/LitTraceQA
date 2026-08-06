@@ -10,22 +10,7 @@ from .table_structure import table_text_to_structure
 
 
 SYSTEM_PROMPT = (
-    "You are a LitTraceQA answer model. You must answer using only the provided candidate papers, answer contract, "
-    "and selected evidence packets. The selected evidence packets use official source_type values. Some packets match "
-    "the primary_evidence_type, and some packets provide supporting context. Use supporting context when it helps, "
-    "but do not invent evidence. Output valid JSON only."
-)
-
-
-ANSWER_STYLE_GUIDE = (
-    "Answer style guide inferred from the public validation answer format, expressed only as generic formatting rules:\n"
-    "- Default freeform style is extractive and short. Most freeform answers are a number, an integer count, a yes/no value, an entity name, a method name, a dataset name, an author name, a paper title, or a short phrase.\n"
-    "- For numeric questions such as how much, by how much, score, accuracy, F1, AP, NRMSE, standard deviation, count, number of references, number of panels, or number of parentheses, answer.freeform.text should contain only the final number unless the question explicitly asks for units or a full sentence.\n"
-    "- For which/who/what entity questions, answer.freeform.text should contain only the entity or short span, not a sentence explaining where it appeared.\n"
-    "- For yes/no questions, answer.freeform.text should usually be Yes or No. Add a short clause only if the question asks for a comparison statement rather than a bare yes/no.\n"
-    "- When both freeform and multiple_choice are required, answer.freeform.text should normally be the short answer content corresponding to answer.multiple_choice.gold, not a rationale.\n"
-    "- Use sentence-length freeform only for broad synthesis questions asking across papers, among methods, what happens/trend, what base model each method uses, or requests that naturally require a list or mapping. Even then, keep it concise and answer-first.\n"
-    "- For table answers, use the exact table_schema columns. Row keys should be concise canonical labels; numeric cells should be JSON numbers when possible.\n"
+    "Answer only from INPUT evidence and candidate papers. Do not invent facts or evidence. Return valid JSON only."
 )
 
 
@@ -437,25 +422,16 @@ def build_symbolic_answer_prompt(
             str(input_example.get("primary_evidence_type") or ""),
         )
     payload = {
-        "query_id": input_example.get("query_id"),
-        "task_family": input_example.get("task_family"),
-        "primary_evidence_type": input_example.get("primary_evidence_type"),
         "question": input_example.get("question"),
-        "answer_contract": contract,
+        "answer_contract": {key: value for key, value in contract.items() if key != "query_id"},
         "answer_style_guidance": answer_style_guidance,
         "multi_paper_contribution_required": multi_paper_task,
-        "required_answer_fields": required_answer_fields,
-        "required_answer_shape": required_answer_shape,
         # Candidate titles are not L2 evidence. In keyed mode the model sees
         # only immutable paper IDs; a table cell requiring a formal title is
         # resolved from its C-key's paper ID after factual grounding.
         "candidate_papers": ([{"paper_id": c.get("paper_id")} for c in candidate_records] if keyed_mode else [_project_candidate_for_prompt(c) for c in candidate_records]),
-        "selected_evidence_record_count": len(selected_evidence),
         "evidence_output_limit": evidence_output_limit,
         "table_plan_limit": table_plan_limit,
-        "evidence_packet_count": len(selected_evidence),
-        "has_partial_artifacts": bool(selected_contexts.get("has_partial_artifacts") or selected_contexts.get("partial_artifacts_present")),
-        "attached_image_refs": selected_contexts.get("attached_image_refs", []),
     }
     if evidence_hierarchy:
         projection = keyed_hierarchy_prompt_projection(evidence_hierarchy) if keyed_mode else hierarchy_prompt_projection(evidence_hierarchy)
@@ -466,7 +442,7 @@ def build_symbolic_answer_prompt(
         # a fixed context window without adding information for generation.
         projection.pop("_card_metadata", None)
         payload["evidence_hierarchy"] = projection
-        payload["evidence_hierarchy_format"] = "L2-only keyed cards; l2_triple_rows are compact facts whose support_card_keys must be cited. l1_expansion_rows/l0_expansion_rows appear only when the sufficiency gate requested a named expansion, and use the same C-key citation rule. Cxxx keys resolve post-hoc to raw L0. Locators are unavailable during generation. A non-empty image_ref on a card or micro row denotes its attached cropped image; visual facts must cite that Cxxx key." if keyed_mode else "L2 cards contain only verified propositions and support_refs. L1 excerpts are optional disambiguation context. L3 is navigation, never factual support."
+        payload["evidence_hierarchy_format"] = "L2 cards and micro rows are factual; L3 is navigation only. Cite triple/expansion facts through support_card_keys. image_ref maps a card to its attached crop." if keyed_mode else "L2 cards are factual; L1 disambiguates; L3 is navigation only."
     elif evidence_ledger:
         payload["evidence_ledger_format"] = "PAPER <paper_id>; SECTION <title>; <evidence_ref> TAB p<page> TAB <source_type> TAB [label] TAB <extractive text>"
         payload["evidence_ledger"] = evidence_ledger
@@ -490,7 +466,6 @@ def build_symbolic_answer_prompt(
         # rule directly displaces a provenance-preserving L2 micro card under
         # the fixed prompt budget.
         target = {
-            "query_id": "<same query id>",
             "gold_papers": [{"paper_id": "<candidate paper id>"}],
             "claim_to_support_keys": {"<claim_id>": ["C001"]},
             "answer": required_answer_shape,
@@ -500,12 +475,10 @@ def build_symbolic_answer_prompt(
         if "table" in required_answer_fields:
             target["table_answer_plan"] = [{"row_support_key": "C001", "values": {"<table_schema column>": "<value>"}}]
         keyed_instructions = [
-            "Use only INPUT.evidence_hierarchy L2 cards/micro rows, verified l2_triple_rows, gate-requested l1_expansion_rows/l0_expansion_rows, linked attached images, and candidate paper_id keys. A triple or expansion row's support_card_keys are the only allowed citations for its facts. Locators, titles, and evidence refs are unavailable. When a C-card or micro row has image_ref, inspect only that matching attached crop and cite the same C-key for every visual fact.",
-            "Return one JSON object only, matching TARGET_JSON_SHAPE. Include exactly the answer fields required by answer_contract; omit every other answer type.",
-            "Every factual claim must cite one to four visible Cxxx keys in claim_to_support_keys. Never output R/P/S keys, evidence_refs, locators, page numbers, labels, or invented keys.",
-            "For a multi-paper answer, list only candidate papers supported by selected Cxxx cards. Do not enumerate candidates.",
-            "For a table answer, each row needs row_support_key plus exact table_schema columns. For a Paper Title cell, output the source card's paper_id, not a title; runtime canonicalizes it after grounding.",
-            "For multiple choice output exactly one listed option key. Freeform must be the shortest answer span. Do not invent facts; sparse grounded output is preferable to unsupported output.",
+            "Use only L2 cards/micro rows, verified triples or requested expansions, and matching image_ref crops. Cite triple or expansion facts through their support_card_keys.",
+            "Match TARGET_JSON_SHAPE and answer_contract exactly. Every factual claim needs one to four visible Cxxx keys; never emit raw refs, locators, page numbers, labels, R/P/S keys, or invented keys.",
+            "Use only candidate paper IDs. For multi-paper answers list only supported contributors. For tables use row_support_key and exact schema columns; output the source C-card paper_id for Paper Title.",
+            "For multiple choice output one listed key. Freeform is the shortest supported answer span; prefer sparse grounded output to unsupported claims.",
         ]
         user = (
             "\n".join(keyed_instructions)
@@ -514,36 +487,24 @@ def build_symbolic_answer_prompt(
         )
         return [{"role": "system", "content": "Return valid JSON only."}, {"role": "user", "content": user}]
     user = (
-        "Use only the provided candidate metadata and selected symbolic evidence packets. These packets were generated from rendered PDF page images by a separate VLM parser "
-        "and validated by a symbolic layer.\n\n"
-        "You will receive an evidence_hierarchy, an evidence_ledger, or paper_evidence_packets. In keyed_l2_only mode, the hierarchy contains only L2 propositions/structured views and compact paper/type/label keys; raw L0/L1 text, locators, pages, and evidence refs are deliberately unavailable. l2_cards are claim-oriented cards; l2_micro_rows follow l2_micro_schema and contain compact propositions. Cite Cxxx card keys in claim_to_support_keys and let the runtime resolve them after generation. The evidence ledger is grouped as paper -> section -> extractive evidence rows. Each evidence row begins with its unique evidence_ref, followed by page, source_type, optional label, and text. The packet representation is grouped as paper -> sections -> evidence packages -> records; inherited metadata must be merged into each record. source_type must be one of text_span, table, figure, equation_algorithm, citation_context. "
-        "Ranking scores, retrieval scores, selector scores, parser confidence values, bbox, and internal record IDs are intentionally withheld from this prompt. "
-        "Do not invent page numbers, table_id, figure_id, equation_id, algorithm_id, citation_id, image references, or hidden record IDs. Cite evidence only by echoing evidence_ref; the system deterministically restores the corresponding input locator.\n\n"
+        "Use only INPUT evidence. Cite direct support by echoing evidence_refs; the runtime restores locators. Do not invent IDs, pages, or evidence.\n"
         + (
-            "This is a multi-paper or cross-paper task. Identify all papers that contribute evidence to the final answer. Do not output only the single most relevant paper if multiple papers support the answer. "
-            "In addition to official fields, include a compact internal contributing_papers array containing only paper_id values. Use it to make gold_papers complete across all contributing papers. Put every evidence_ref only in the single top-level evidence array; never repeat it per paper.\n\n"
+            "List every supported contributor in contributing_papers and gold_papers; keep evidence_refs top-level.\n"
             if multi_paper_task
             else ""
         )
-        + "You must follow answer_contract exactly. Output every answer field listed in required_answer_fields using required_answer_shape. Missing any field in required_answer_fields is invalid. If required_answer_fields includes both freeform and multiple_choice, output both fields. Do not treat multiple_choice as a replacement for freeform. Do not output freeform, multiple_choice, or table fields unless that answer type is explicitly listed. "
-        "For multiple_choice, choose exactly one key from the provided options. Multiple-choice means single-choice in this benchmark: output one option key, not several keys and not option text. Do not invent option keys. Do not choose a key that is not listed. Before choosing, compare every provided option against the selected evidence and the question: reject options contradicted by evidence, prefer options directly supported by evidence, and among partially supported options choose the one that is most specific and most directly answers the question. If options are provided, do not leave answer.multiple_choice.gold empty; choose the best-supported or closest option even when evidence is imperfect. Use the option text when reasoning, but output only the final option key in answer.multiple_choice.gold. If multiple_choice is required but no options are provided, return only a letter A/B/C/D when genuinely confident; otherwise set answer.multiple_choice.gold to an empty string. "
+        + "Match answer_contract and TARGET_JSON_SHAPE exactly; include only its answer types and use candidate paper IDs only. "
+        "For multiple choice choose exactly one listed option key. For freeform follow answer_style_guidance and give the shortest supported span. "
         + (
-            f"For table answers, do not rely on freely writing a final table from memory. Output at most {table_plan_limit} table_answer_plan rows, prioritizing the rows that directly answer the question and distinct contributing papers. Each item must cite one Cxxx in row_support_key and give values keyed by the requested table_schema column names. The runtime resolves the Cxxx to the raw table and restores row_source after generation. "
+            f"For tables output at most {table_plan_limit} table_answer_plan rows with a direct Cxxx row_support_key and exact schema columns; the runtime restores row sources. "
             if evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only"
-            else f"For table answers, do not rely on freely writing a final table from memory. Output at most {table_plan_limit} table_answer_plan rows. Select relevant table packets, rows, or cells and output an internal table_answer_plan. Each table_answer_plan item must have row_source with paper_id, page, and label, plus values keyed by the requested table_schema column names. The system will assemble answer.table.rows from table_answer_plan. You may also include answer.table.rows as a best-effort copy, but table_answer_plan is the authoritative table plan. If a table packet has table_structure, use its header_rows, columns, rows, and cells to resolve row/column alignment while keeping the original text as the source of truth. "
+            else f"For tables output at most {table_plan_limit} table_answer_plan rows with an input row_evidence_ref, row_source, and exact schema columns. Use table_structure for alignment. "
         )
-        + "For freeform, always use the object shape answer.freeform.text, for example \"freeform\": {\"text\": \"<concise answer>\"}. Do not output freeform as a bare string. Freeform must be the shortest final answer that directly satisfies the question, not a rationale or explanatory sentence. If the answer is a number, output only the number unless the question explicitly asks for units. If the answer is a count, output only the integer. If the answer is an entity, method, dataset, author, paper title, option text, or short phrase, output only that exact short span. If the answer is yes/no, output only Yes or No. If both freeform and multiple_choice are required, make freeform the short answer content corresponding to the chosen option, not an explanation of why that option is correct. Do not read or assume gold answers.\n\n"
-        f"{ANSWER_STYLE_GUIDE}\n"
-        "This baseline does not use native PDF input and does not access online paper links, DOI pages, arXiv, OpenReview, or conference webpages during answer generation.\n"
-        f"{image_note}\n"
-        f"{partial_note}\n\n"
-        # Compact JSON preserves all semantic fields while leaving more of the
-        # model context window for evidence text rather than indentation.
+        + f"{image_note} {partial_note}\n"
         f"INPUT:\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
         "TARGET_JSON_SHAPE:\n"
         "{\n"
-        '  "query_id": "<same query id>",\n'
-        '  "gold_papers": [{"paper_id": "<predicted paper id>"}],\n'
+        '  "gold_papers": [{"paper_id": "<candidate paper id>"}],\n'
         + (
             '  "contributing_papers": [{"paper_id": "<candidate paper id>"}],\n'
             if multi_paper_task
@@ -556,31 +517,6 @@ def build_symbolic_answer_prompt(
         )
         + ('  "claim_to_support_keys": {"<claim_id>": ["C001"]},\n' if evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only" else '  "evidence_refs": ["<an evidence_ref copied exactly from an input record>"],\n')
         + f'  "answer": {json.dumps(required_answer_shape, ensure_ascii=False)}\n'
-        "}\n\n"
-        "Rules:\n"
-        "1. Output JSON only.\n"
-        "2. Do not output markdown.\n"
-        "3. query_id must match input.\n"
-        "4. gold_papers must only use candidate paper_ids.\n"
-        + (
-            "4a. For multi-paper tasks, contributing_papers must list every candidate paper that contributes evidence to the final answer. gold_papers must include every contributing_papers.paper_id. Do not collapse multiple supporting papers into only one paper. Do not add supporting_evidence or contribution fields there.\n"
-            if multi_paper_task
-            else ""
-        )
-        + ("5. In keyed_l2_only mode, do not output evidence_refs. Output claim_to_support_keys: every value must be a distinct Cxxx key from l2_cards or l2_micro_rows, with at least one key for every answer claim and at most four keys per claim. Never enumerate cards or use keys as a recall list. Do not emit Rxxx, page, locator, raw evidence ref, or invented key.\n" if evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only" else "5. Use only the flat evidence_refs string array. Every item must be one distinct evidence_ref copied from an input record. Do not emit an evidence object array and do not rewrite paper_id, source_type, page, or object IDs; the system restores them from the ref.\n")
-        + ("5a. Cxxx keys are the only proof identifiers. Choose cards whose proposition or structured table view directly supports the answer; the runtime will reject invalid or unsupported keys.\n" if evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only" else "5a. When evidence_hierarchy is present, every evidence_ref must appear either in a card support_refs or as an L2 micro-evidence support_ref. Do not cite L3 navigation. An L2 card or micro proposition is a compressed reading note, never a replacement for its raw support_ref.\n")
-        + ("6. Every factual answer claim needs at least one Cxxx. Never emit raw evidence refs, locators, pages, Rxxx keys, or invented identifiers.\n" if evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only" else f"6. Use only evidence_refs whose records directly support the answer. Output at most {evidence_output_limit} distinct refs, then stop; never repeat a ref or enumerate all selected records. In a multi-paper task, use at most two refs per contributing paper unless a table_answer_plan requires another row source.\n")
-        + "7. Do not invent evidence_ref, table_id, figure_id, equation_id, algorithm_id, citation_id, bbox, record_id, or page.\n"
-        "8. attached_image_refs lists images in the same order as the image attachments following the text. A record image_ref identifies the corresponding attached image.\n"
-        "9. If required_answer_fields includes an answer type, include that answer field. If required_answer_fields does not include an answer type, omit that answer field.\n"
-        "10. For table answers, use table_schema column names exactly.\n"
-        "11. For table evidence packets with table_structure, align values by table_structure.columns and table_structure.rows before answering.\n"
-        "12. For multiple_choice with options, internally evaluate all options first, then output exactly one option key. Never output an empty key when options are present.\n"
-        "13. For freeform answers, obey answer_style_guidance.freeform_granularity and answer_style_guidance.freeform_rule. Output the minimal gold-style answer span unless answer_style_guidance explicitly permits a concise sentence/list.\n"
-        "14. If a question asks for a single value but both freeform and table are required, keep freeform to the single value or short span and put structured details in answer.table.rows.\n"
-        "15. Numeric table values should be JSON numbers when possible.\n"
-        + (f"16. If table is required, output no more than {table_plan_limit} table_answer_plan rows. Each plan row must cite a Cxxx that directly supports its values; the source may be a table, figure, equation, citation, or text proposition. Use a table view when present to align headers and cells. Do not output row_source or a raw reference. Do not invent columns outside table_schema.\n" if evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only" else f"16. If table is required, output no more than {table_plan_limit} table_answer_plan rows. Each plan row must cite row_evidence_ref from an L2 card or micro-evidence item, row_source.paper_id, row_source.page, row_source.label, and values for the requested columns. Do not invent columns outside table_schema.\n")
-        + ("16a. In keyed_l2_only mode, for a table column named Paper Title, output the source paper_id from the selected Cxxx card rather than a title string. The runtime will deterministically canonicalize that ID to its candidate title only after the C-key is grounded.\n" if keyed_mode else "")
-        + "17. If selected evidence is insufficient, keep evidence sparse and avoid unsupported claims, but still choose the closest multiple-choice option when options are provided."
+        "}\n"
     )
     return [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": user}]
