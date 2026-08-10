@@ -1,0 +1,446 @@
+结合目前你的系统变化（官方集失去 `task_family` 和 `main_source`），我认为旧 selector 中很多 **人工先验 bonus 已经失去合理性**。现在应该重新审视：哪些 bonus 是在补偿缺失信息，哪些只是历史实验中的 heuristic。
+
+核心原则：
+
+> 如果一个 bonus 依赖官方隐藏标签（task family/main source），应该删除或替换；如果一个 bonus 依赖文档自身可观察结构，可以保留。
+
+---
+
+## 1. 可以删除或弱化的 bonus
+
+### (1) `primary_evidence_type_boost`
+
+如果它依赖：
+
+```text
+query task family → expected primary source type
+```
+
+例如：
+
+* table task → table boost
+* figure task → figure boost
+
+那么现在不合理。
+
+原因：
+
+以前：
+
+[
+P(source_type|task_family)
+]
+
+现在：
+
+未知。
+
+强行保留会导致：
+
+* 错误偏置；
+* source type recall下降；
+* multi-paper中挤压真实 text evidence。
+
+建议：
+
+删除作为 hard/soft ranking bonus。
+
+替代：
+
+让 evidence plan 输出：
+
+```json
+{
+ required_evidence_types:
+ [
+   "table",
+   "text"
+ ]
+}
+```
+
+然后作为 query-conditioned signal。
+
+---
+
+### (2) `query_hint_bonus`
+
+这个通常是：
+
+```text
+validation input hint
+→ evidence type
+```
+
+如果官方不再提供：
+
+直接删除。
+
+这是典型 benchmark leakage。
+
+---
+
+### (3) `target_locator_bonus`
+
+如果依赖：
+
+* main source；
+* gold-like locator；
+* task family中的定位信息；
+
+删除。
+
+但如果只是：
+
+```text
+query contains Figure 3
+query contains Table 2
+```
+
+可以保留。
+
+因为这是用户 query 本身的信息。
+
+---
+
+### (4) `page_position_prior`
+
+这个我认为应该谨慎。
+
+以前可能：
+
+```text
+answer usually in early section
+```
+
+这种 heuristic。
+
+但你的实验已经说明：
+
+multi-paper semantic tail 是主要问题。
+
+page prior 对：
+
+* method；
+* introduction；
+* abstract
+
+可能有效。
+
+但是对于：
+
+* appendix;
+* experiment detail;
+* dataset statistics；
+
+可能伤害。
+
+建议：
+
+从固定 bonus 改为：
+
+弱 prior。
+
+例如：
+
+[
+S'=S+\lambda P(page)
+]
+
+其中：
+
+[
+\lambda \rightarrow small
+]
+
+甚至只作为 tie breaker。
+
+---
+
+## 2. 可以保留的结构 bonus
+
+### (1) Section heading boost
+
+我认为仍然有价值。
+
+因为 section title 是论文结构语义：
+
+例如：
+
+query:
+
+```text
+training strategy
+```
+
+section:
+
+```text
+Implementation Details
+Training Configuration
+```
+
+这是合法 signal。
+
+注意：
+
+不要认为 section title 是 evidence。
+
+它只是：
+
+[
+P(section|query)
+]
+
+的辅助。
+
+---
+
+### (2) Candidate paper prior
+
+保留。
+
+因为 paper discovery 后：
+
+不同 paper 的可信度不同。
+
+但是：
+
+不要使用：
+
+```text
+main_source
+```
+
+而使用：
+
+* metadata retrieval score；
+* paper rerank score。
+
+---
+
+### (3) Object/reference relation
+
+保留。
+
+例如：
+
+```text
+text record explicitly references Table 3
+```
+
+这是文档内部结构，不是 benchmark label。
+
+---
+
+# 3. single/multipaper 分类器是否需要？
+
+我认为需要。
+
+原因：
+
+single-paper 和 multi-paper 的 selector objective 不同。
+
+Single:
+
+目标：
+
+[
+find\ evidence\ inside\ one\ document
+]
+
+Multi:
+
+目标：
+
+[
+cover\ multiple\ evidence\ sources
+]
+
+对应策略不同：
+
+|                    | single          | multi          |
+| ------------------ | --------------- | -------------- |
+| paper diversity    | 不重要             | 重要             |
+| coverage           | 弱               | 强              |
+| slot decomposition | 简单              | 必要             |
+| budget allocation  | section         | paper+section  |
+| rerank             | local relevance | coverage-aware |
+
+所以应该保留一个：
+
+```text
+query type classifier
+```
+
+---
+
+# 4. 是否让 evidence plan LLM 输出？
+
+我的答案：
+
+**可以，而且比单独训练 classifier 更合理。**
+
+因为你的 evidence plan 本身已经需要理解：
+
+* entity数量；
+* comparison关系；
+* required evidence；
+* conditions。
+
+single/multi 本质上是它的一个低层属性。
+
+例如：
+
+Evidence planner 输出：
+
+```json
+{
+task_structure:
+{
+ type:"comparison",
+ papers:[
+   "IMM",
+   "D-FINE"
+ ]
+}
+}
+```
+
+自然得到：
+
+```text
+multi-paper=true
+```
+
+---
+
+## 但是不要让 LLM 直接输出最终 routing decision
+
+不要：
+
+```json
+{
+ mode:"multi"
+}
+```
+
+作为唯一依据。
+
+因为 LLM 分类可能不稳定。
+
+更合理：
+
+输出结构：
+
+```json
+{
+ entities:[
+  IMM,
+  D-FINE
+ ],
+
+ comparison_targets:2,
+
+ evidence_slots:[
+  ...
+ ],
+
+ inferred_paper_count:2
+}
+```
+
+然后 deterministic：
+
+```python
+if len(entities)>=2:
+    multi_paper=True
+elif comparison_targets:
+    multi_paper=True
+else:
+    single_paper=True
+```
+
+即：
+
+LLM负责：
+
+> 语义解析
+
+规则负责：
+
+> routing decision
+
+---
+
+# 5. 推荐的新 routing 设计
+
+现在可以简化：
+
+```text
+Query
+ |
+Evidence Planner LLM
+ |
+ +----------------+
+ |                |
+Evidence slots    Query structure
+                 |
+                 v
+          Single/Multi classifier
+                 |
+       -------------------
+       |                 |
+   Single mode       Multi mode
+       |                 |
+local selector     coverage selector
+```
+
+---
+
+# 6. 最终建议删除/替换列表
+
+| 组件                          | 建议                     |
+| --------------------------- | ---------------------- |
+| primary_evidence_type_boost | 删除                     |
+| query_hint_bonus            | 删除                     |
+| target_locator_bonus        | 删除或仅保留query显式locator   |
+| page_position_prior         | 弱化                     |
+| section_heading_boost       | 保留                     |
+| paper retrieval score prior | 保留                     |
+| object-reference relation   | 保留                     |
+| source-type bonus           | 改为evidence-plan driven |
+| single/multi routing        | 新增                     |
+
+---
+
+## 关于 evidence plan LLM 替代 classifier 的最终判断
+
+可以，而且推荐。
+
+但形式应该是：
+
+错误：
+
+```
+LLM → single/multi label
+```
+
+正确：
+
+```
+LLM → structured query analysis
+       |
+       + entity count
+       + comparison relation
+       + evidence slots
+       + paper scope
+
+deterministic router → execution mode
+```
+
+这样符合你整个系统方向：
+
+**LLM负责不可确定的语义理解，symbolic component负责稳定的系统控制。**
+
+这也能让后续论文中更容易解释：不是用 LLM 替代所有 heuristics，而是将原本依赖 benchmark metadata 的人工规则转化为 query-conditioned, auditable planning。

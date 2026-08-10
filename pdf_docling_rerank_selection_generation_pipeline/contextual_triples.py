@@ -14,6 +14,7 @@ from collections import defaultdict
 from typing import Any
 
 from .metadata_index import tokenize
+from .task_structure import as_source_types
 
 
 TRIPLE_GRAPH_VERSION = "contextual_triples_v1"
@@ -127,7 +128,10 @@ def _navigation_seed_refs(question: str, hierarchy: dict[str, Any], catalog: dic
         total = max(1, len(document_terms))
         document_frequency = {term: sum(term in values for values in document_terms.values()) for term in all_terms}
         scored: list[tuple[float, str]] = []
-        primary_type = str(hierarchy.get("primary_evidence_type") or "")
+        preferred = tuple(as_source_types(hierarchy.get("preferred_source_types") or ()))
+        if not preferred:
+            legacy_primary = str(hierarchy.get("primary_evidence_type") or "")
+            preferred = (legacy_primary,) if legacy_primary else ()
         for ref, values in document_terms.items():
             overlap = all_terms.intersection(values)
             if not overlap:
@@ -136,7 +140,7 @@ def _navigation_seed_refs(question: str, hierarchy: dict[str, Any], catalog: dic
                 math.log((total + 1) / (document_frequency[term] + 1)) * (1.0 if term in terms else 0.55)
                 for term in overlap
             )
-            if str(catalog[ref].get("source_type") or "") == primary_type:
+            if str(catalog[ref].get("source_type") or "") in preferred:
                 score += 0.25
             scored.append((-score, ref))
         for _, ref in sorted(scored):

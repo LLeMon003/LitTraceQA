@@ -11,12 +11,18 @@ from .config import load_pipeline_config
 from .contextual_triples import attach_contextual_triple_graph
 from .data_io import find_official_file, read_jsonl, write_jsonl
 from .evidence_hierarchy import attach_cards, build_l0_l1_l3, card_generation_messages, hierarchy_metrics, load_processed_records
+from .task_structure import derive_task_structure
 from .vlm_answer_client import VLMAnswerClient
 
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Build auditable L0-L3 evidence hierarchy from frozen selection.")
     parser.add_argument("--official-dir", default="official_dev")
+    parser.add_argument(
+        "--inputs",
+        default="",
+        help="Input JSONL (e.g. official_dev/data/test.jsonl). Defaults to official validation_inputs.jsonl.",
+    )
     parser.add_argument("--selected-contexts-input", required=True)
     parser.add_argument("--candidate-papers-input", required=True)
     parser.add_argument("--processed-output-dir", default="")
@@ -31,6 +37,7 @@ def _args() -> argparse.Namespace:
     )
     parser.add_argument("--only-query-ids", default="")
     parser.add_argument("--dry-run", action="store_true", help="Build deterministic L0/L1/L3 and extractive L2 cards without an API call.")
+    parser.add_argument("--slot-plans-input", default="", help="Frozen slot_plans.jsonl from the retrieval stage; drives task structure in the hierarchy.")
     return parser.parse_args()
 
 
@@ -50,7 +57,13 @@ def main() -> int:
     config = load_pipeline_config(args.env_path)
     mode = args.mode or config.evidence_hierarchy_card_mode
     only = {part.strip() for part in args.only_query_ids.split(",") if part.strip()}
-    inputs = {str(row.get("query_id") or ""): row for row in read_jsonl(find_official_file(args.official_dir, "validation_inputs.jsonl"))}
+    inputs_path = Path(args.inputs) if args.inputs else find_official_file(args.official_dir, "validation_inputs.jsonl")
+    inputs = {str(row.get("query_id") or ""): row for row in read_jsonl(inputs_path)}
+    plans = {
+        str(row.get("query_id") or ""): row.get("plan")
+        for row in read_jsonl(args.slot_plans_input)
+        if isinstance(row.get("plan"), dict)
+    } if args.slot_plans_input else {}
     selections = {
         query_id: row
         for row in read_jsonl(args.selected_contexts_input)
@@ -72,6 +85,7 @@ def main() -> int:
     for query_id, sample in inputs.items():
         if only and query_id not in only:
             continue
+        task_structure = derive_task_structure(sample, plans.get(query_id))
         selected = (selections.get(query_id) or {}).get("selected_records") or []
         candidates = candidates_by_query.get(query_id, [])
         hierarchy = build_l0_l1_l3(
@@ -82,6 +96,8 @@ def main() -> int:
         )
         hierarchy["task_family"] = sample.get("task_family")
         hierarchy["primary_evidence_type"] = sample.get("primary_evidence_type")
+        hierarchy["task_is_multi"] = task_structure.is_multi_paper
+        hierarchy["preferred_source_types"] = list(task_structure.preferred_source_types)
         hierarchy["prompt_micro_index_chars"] = config.evidence_hierarchy_micro_index_chars
         hierarchy["prompt_micro_text_chars"] = config.evidence_hierarchy_micro_text_chars
         hierarchy["keyed_micro_index_chars"] = config.evidence_hierarchy_keyed_micro_index_chars
@@ -104,7 +120,7 @@ def main() -> int:
         hierarchy = attach_cards(
             str(sample.get("question") or ""), hierarchy, mode=mode,
             max_claims=config.evidence_hierarchy_max_claims, max_cards=config.evidence_hierarchy_max_cards,
-            primary_evidence_type=str(sample.get("primary_evidence_type") or ""),
+            preferred_source_types=task_structure.preferred_source_types,
             llm_result=raw_card_response,
         )
         if args.contextual_triples:

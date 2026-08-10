@@ -1,0 +1,53 @@
+{
+  "schema_version": 1,
+  "created_at_utc": "2026-07-19T12:40:07.0290587Z",
+  "experiment_id": "V23_MC_BLANK_RECOVERY_001",
+  "classification_at_lock": "CANDIDATE_PENDING_REMOTE_AND_CLEAN_REPLAY",
+  "branch": "optimization/v23-mc-blank-recovery-001",
+  "implementation_commit": "ac444043827ef5938abeabab0dfe2f793e48d69e",
+  "baseline_tag": "v2.3",
+  "baseline_tag_object": "3a353891f807946f0f6d9a34a771ef32b639e843",
+  "baseline_commit": "409cdd5a53e2ed9cf3c2c8bdb6e79f1e5dd4d9fe",
+  "source_prediction_sha256": "A3B9140444573CF1DA529091C653B9B7EC9CDAC61D453FA2724BCB1134442281",
+  "candidate_prediction_sha256": "98C9AF8031E0CA4CEF59E21554A53660740C2C28703DE5E49D725A0E5A0A6597",
+  "decision_sha256": "DA0175EAAB1FA4236E7A0AED5D7C0173CE5916A3C510327F76C424D9BCB1C37C",
+  "official_evaluation_sha256": "480DB129FBA3C8D2CAF4E51A514E93E644D9626FD0E9CEE2B0D3F0B6AD3DED51",
+  "official_evaluator_invocation_count": 1,
+  "mc_baseline": "27/41",
+  "mc_candidate": "33/41",
+  "mc_improvement_correct": 6,
+  "non_mc_metrics_unchanged": true,
+  "post_evaluation_candidate_modification": false,
+  "finalization_api_calls": 0,
+  "finalization_official_evaluator_calls": 0,
+  "failed_evidence_pruning_preserved_as_negative_result": true,
+  "candidate_behavior_includes_failed_evidence_pruning": false,
+  "required_test_count": 36,
+  "test_result": {
+    "status": "PASS",
+    "tests_passed": 36,
+    "jsonl_transport": 6,
+    "official_contract": 10,
+    "phase7_isolation_and_resume": 4,
+    "mc_recovery": 4,
+    "candidate_finalization": 12,
+    "official_evaluator_invocations_during_tests": 0
+  },
+  "local_audits": {
+    "secret_scan": "PASS",
+    "absolute_path_scan": "PASS",
+    "large_file_scan": "PASS",
+    "query_id_specific_logic_scan": "PASS",
+    "candidate_isolation": "PASS",
+    "remote_v2_3_tag_matches_local": true
+  },
+  "artifact_manifest": "ARTIFACT_REQUIREMENTS.json",
+  "prohibitions": {
+    "modify_frozen_prediction": true,
+    "change_mc_recovery_logic": true,
+    "rerun_official_evaluator": true,
+    "make_api_calls": true,
+    "merge_main": true,
+    "modify_v2_3": true
+  }
+}

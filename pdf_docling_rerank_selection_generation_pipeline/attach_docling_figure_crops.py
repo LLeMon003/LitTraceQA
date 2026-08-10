@@ -66,6 +66,25 @@ def _debug_bbox_index(debug_path: Path) -> dict[str, dict[str, Any]]:
     return index
 
 
+def _pictures_on_page(docling_path: Path, page: int) -> list[tuple[int, list[float]]]:
+    """Docling pictures on a page as (index, [l, t, r, b]) bottom-left bboxes."""
+    try:
+        payload = json.loads(docling_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    pictures: list[tuple[int, list[float]]] = []
+    for index, picture in enumerate(payload.get("pictures") or [], start=1):
+        prov = (picture.get("prov") or [{}])[0]
+        bbox = prov.get("bbox")
+        if prov.get("page_no") != page or not isinstance(bbox, dict):
+            continue
+        try:
+            pictures.append((index, [float(bbox["l"]), float(bbox["t"]), float(bbox["r"]), float(bbox["b"])]))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return pictures
+
+
 class _PdfDocumentCache:
     """Keep one PyMuPDF document open per paper during a run."""
 
@@ -150,6 +169,13 @@ def main() -> int:
                 bbox_index = _debug_bbox_index(debug_path)
                 indices[paper_id] = bbox_index
             info = bbox_index.get(record_id)
+            page = record.get("page")
+            if not info and page is not None:
+                docling_path = Path(args.docling_output_dir) / paper_id / "raw_docling_output" / f"{paper_id}.docling.json"
+                pictures = _pictures_on_page(docling_path, int(page))
+                if len(pictures) == 1:
+                    picture_index, bbox = pictures[0]
+                    info = {"page_no": int(page), "bbox": bbox, "fallback": f"page_single_picture_{picture_index}"}
             if not info:
                 unresolved += 1
                 continue

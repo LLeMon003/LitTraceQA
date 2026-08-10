@@ -117,6 +117,7 @@ HYBRID_SCORE_WEIGHTS = {
     "abstract_bm25": 1.0,
     "full_bm25": 0.8,
     "alias_bm25": 4.5,
+    "topic_overlap": 400.0,
     "venue_match_boost": 12.0,
     "venue_mismatch_penalty": -8.0,
     "year_match_boost": 6.0,
@@ -293,9 +294,15 @@ class SimpleBM25Retriever(_BaseRetriever):
 
 
 class HybridAliasRetriever(_BaseRetriever):
-    def __init__(self, records: list[dict[str, Any]], term_substring_boost: bool = False) -> None:
+    def __init__(
+        self,
+        records: list[dict[str, Any]],
+        term_substring_boost: bool = False,
+        topic_enabled: bool = False,
+    ) -> None:
         self.records = records
         self.term_substring_boost = term_substring_boost
+        self.topic_enabled = topic_enabled
         self.features: list[dict[str, Any]] = []
         title_corpus: list[list[str]] = []
         abstract_corpus: list[list[str]] = []
@@ -334,6 +341,44 @@ class HybridAliasRetriever(_BaseRetriever):
         self.full_index = BM25Okapi(full_corpus)
         self.alias_index = BM25Okapi(alias_corpus)
         self.alias_df = Counter(alias for features in self.features for alias in features["aliases"])
+        if self.topic_enabled:
+            self._build_topic_profiles()
+
+    def _build_topic_profiles(self) -> None:
+        """idf-weighted topic profile per paper: title (3x) + abstract (1x) + aliases (2x)."""
+        counts: list[Counter] = []
+        doc_freq: Counter = Counter()
+        for idx, record in enumerate(self.records):
+            profile: Counter = Counter()
+            for term in tokenize(str(record.get("title") or "")):
+                profile[term] += 3
+            for term in tokenize(str(record.get("abstract") or "")):
+                profile[term] += 1
+            for alias in self.features[idx]["aliases"]:
+                profile[alias] += 2
+            counts.append(profile)
+            doc_freq.update(set(profile))
+        total = max(1, len(self.records))
+        self.topic_idf = {
+            term: 1.0 + math.log(total / max(1, freq))
+            for term, freq in doc_freq.items()
+        }
+        self.topic_profiles: list[Counter] = []
+        for profile in counts:
+            weighted: Counter = Counter()
+            for term, weight in profile.items():
+                weighted[term] = weight * self.topic_idf.get(term, 1.0)
+            self.topic_profiles.append(weighted)
+
+    @staticmethod
+    def _cosine(left: Counter, right: Counter) -> float:
+        if not left or not right:
+            return 0.0
+        smaller, larger = (left, right) if len(left) <= len(right) else (right, left)
+        dot = sum(weight * larger.get(term, 0.0) for term, weight in smaller.items())
+        norm_left = math.sqrt(sum(weight * weight for weight in left.values()))
+        norm_right = math.sqrt(sum(weight * weight for weight in right.values()))
+        return dot / (norm_left * norm_right) if norm_left and norm_right else 0.0
 
     def retrieve(self, question: str, top_k: int) -> list[dict[str, Any]]:
         tokens = tokenize(question)
@@ -342,6 +387,11 @@ class HybridAliasRetriever(_BaseRetriever):
         query_terms = extract_query_terms(question)
         substring_terms = extract_query_terms_unfiltered(question) if self.term_substring_boost else set()
         query_compact = compact(question)
+        query_topic: Counter = Counter()
+        if self.topic_enabled:
+            for term in tokens:
+                if term not in STOPWORDS:
+                    query_topic[term] += self.topic_idf.get(term, 1.0)
         venues, years = venue_year_hints(question)
         title_scores = self.title_index.get_scores(tokens)
         abstract_scores = self.abstract_index.get_scores(tokens)
@@ -370,6 +420,9 @@ class HybridAliasRetriever(_BaseRetriever):
                 + HYBRID_SCORE_WEIGHTS["full_bm25"] * components["full_bm25"]
                 + HYBRID_SCORE_WEIGHTS["alias_bm25"] * components["alias_bm25"]
             )
+            if self.topic_enabled:
+                components["topic_overlap"] = round(self._cosine(query_topic, self.topic_profiles[idx]), 6)
+                score += HYBRID_SCORE_WEIGHTS["topic_overlap"] * components["topic_overlap"]
             aliases: set[str] = features["aliases"]
             match_terms = query_terms & aliases
             components["matched_aliases"] = sorted(match_terms)
@@ -419,7 +472,11 @@ class HybridAliasRetriever(_BaseRetriever):
             scored.append((idx, float(score), components))
         ranked = sorted(scored, key=lambda item: item[1], reverse=True)[:top_k]
         return [
-            _candidate_from_record(self.records[idx], rank, score, "hybrid_alias", components)
+            _candidate_from_record(
+                self.records[idx], rank, score,
+                "hybrid_alias_topic_optin" if self.topic_enabled else "hybrid_alias",
+                components,
+            )
             for rank, (idx, score, components) in enumerate(ranked, start=1)
         ]
 
@@ -454,14 +511,18 @@ def _get_retriever(
     method: str,
     term_substring_boost: bool = False,
 ) -> _BaseRetriever:
-    normalized_method = method if method in {"bm25_simple", "hybrid_alias"} else "hybrid_alias"
+    normalized_method = method if method in {"bm25_simple", "hybrid_alias", "hybrid_alias_topic_optin"} else "hybrid_alias"
     key = (id(metadata_records), len(metadata_records), normalized_method, term_substring_boost)
     cached = _RETRIEVER_CACHE.get(key)
     if cached is not None:
         return cached
     retriever: _BaseRetriever
-    if normalized_method == "hybrid_alias":
-        retriever = HybridAliasRetriever(metadata_records, term_substring_boost=term_substring_boost)
+    if normalized_method in {"hybrid_alias", "hybrid_alias_topic_optin"}:
+        retriever = HybridAliasRetriever(
+            metadata_records,
+            term_substring_boost=term_substring_boost,
+            topic_enabled=normalized_method == "hybrid_alias_topic_optin",
+        )
     else:
         retriever = SimpleBM25Retriever(metadata_records)
     _RETRIEVER_CACHE[key] = retriever

@@ -1,0 +1,22 @@
+{
+  "schema_version": "littraceqa-official-score-record.v1",
+  "variant": "COMBINED91_strict_mc40_provisional",
+  "upload_file": "91_COMBINED_STRICT_MC40_PROVISIONAL.jsonl",
+  "submission_sha256": "844C6248E8A353783BE7600050BBB247A7716931B24C3C2C10FD173B04CE6914",
+  "split": "test",
+  "source": "user-reported organizer aggregate",
+  "metrics": {
+    "paper_precision_macro": 0.7441,
+    "paper_recall_macro": 0.8509,
+    "paper_f1_macro": 0.734,
+    "evidence_precision_macro": 0.4271,
+    "evidence_recall_macro": 0.4601,
+    "evidence_f1_macro": 0.4236,
+    "multiple_choice_accuracy": 1.0,
+    "freeform_exact_match": null,
+    "table_row_f1_macro": 0.4469,
+    "table_cell_accuracy_macro": 0.2659,
+    "table_cell_accuracy_micro": 0.3103
+  },
+  "item_level_feedback_available": false
+}

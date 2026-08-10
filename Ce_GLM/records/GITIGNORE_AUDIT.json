@@ -1,0 +1,20 @@
+{
+  "created_at_utc": "2026-07-18T17:22:47.509126+00:00",
+  "files_newly_excluded_sample": [],
+  "intentionally_retained_fixtures": [],
+  "legitimate_tracked_exceptions": [
+    "configs/.env.example"
+  ],
+  "missing_required_rules": [],
+  "rules_added_or_verified": [
+    ".env",
+    "!.env.example",
+    "__pycache__/",
+    "*.py[cod]",
+    ".venv/",
+    "outputs/",
+    "*.pdf",
+    ".codex/"
+  ],
+  "status": "PASS"
+}

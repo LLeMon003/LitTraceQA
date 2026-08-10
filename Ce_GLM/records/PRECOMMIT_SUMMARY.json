@@ -1,0 +1,63 @@
+{
+  "status": "PASS",
+  "created_at_utc": "2026-07-18T17:40:18.445185+00:00",
+  "tracked_candidate_count_excluding_manifest_self": 56,
+  "manifest_self_reference_policy": "PRECOMMIT_FILE_MANIFEST.jsonl is excluded from its own JSONL records to avoid a self-referential SHA-256 contradiction; it is intended to be tracked.",
+  "intended_tracked_count_including_manifest": 57,
+  "total_tracked_bytes_excluding_manifest_self": 213772,
+  "largest_tracked_files": [
+    {
+      "path": "scripts/run_ver2_reproduction.py",
+      "size": 41654,
+      "sha256": "2BDDA6BA9F8640C734C4DD4EF05298067E6BC6064C0009E266DAA83C3F81FBBC",
+      "category": "source",
+      "intended_tracked_status": "track"
+    },
+    {
+      "path": "scripts/run_causal_ablation.py",
+      "size": 26802,
+      "sha256": "6552CBE1F197A5B569BC040818B1188D7BEF9F7CD0B69241D4766443CC4A9B43",
+      "category": "source",
+      "intended_tracked_status": "track"
+    },
+    {
+      "path": "docs/FINAL_VERSION_2_3_REPORT.md",
+      "size": 17269,
+      "sha256": "B2FC3C06CB3AAC7E3E91A7E5D58234E24A07BC40EA51870E78C665C46549D5F9",
+      "category": "documentation",
+      "intended_tracked_status": "track"
+    },
+    {
+      "path": "RELEASE_MANIFEST.json",
+      "size": 11203,
+      "sha256": "D73A138E1A269BC7275381CA754437CD904B31F77B4CF9B26D7BA72BDCCF221B",
+      "category": "config",
+      "intended_tracked_status": "track"
+    },
+    {
+      "path": "docs/HANDOFF_SUMMARY.md",
+      "size": 9963,
+      "sha256": "67B71721DE2E3243FD3A777ABE81D3B555995A7982D30DFE1D167B5F14DF78F6",
+      "category": "documentation",
+      "intended_tracked_status": "track"
+    }
+  ],
+  "extension_distribution": {
+    ".example": 1,
+    ".json": 14,
+    ".md": 23,
+    ".py": 12,
+    ".yaml": 4,
+    "[none]": 2
+  },
+  "secret_scan_status": "PASS",
+  "absolute_path_scan_status": "PASS",
+  "large_file_scan_status": "PASS",
+  "prohibited_files": [],
+  "secret_hit_count": 0,
+  "absolute_path_hit_count": 0,
+  "ignored_count": 0,
+  "legitimate_tracked_exceptions": [
+    "configs/.env.example"
+  ]
+}

@@ -13,6 +13,8 @@ from .symbolic_schema import (
     canonicalize_locator,
     to_official_source_type,
 )
+from .table_structure import coerce_number_cell, remap_row_values
+from .task_structure import as_source_types, derive_task_structure
 
 
 FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
@@ -171,28 +173,129 @@ def _canonicalize_paper_title_cell(value: Any, title_by_key: dict[str, str]) -> 
     return value
 
 
+def _table_row_key_columns(input_example: dict[str, Any], columns: list[str]) -> list[str]:
+    """Use the public schema's full row key, not an implicit first column."""
+    schema = input_example.get("table_schema") if isinstance(input_example, dict) else None
+    keys = [
+        str(column.get("name") or "")
+        for column in schema or []
+        if isinstance(column, dict) and column.get("is_row_key") and str(column.get("name") or "") in columns
+    ]
+    return keys or columns[:1]
+
+
+def _table_row_key(row: dict[str, Any], columns: list[str]) -> tuple[str, ...]:
+    return tuple(_table_key(row.get(column)) for column in columns)
+
+
+def _structured_table_value(
+    question: str, row_key: Any, value_column: str, records: list[dict[str, Any]] | None
+) -> str | None:
+    """Return one unambiguous selected-table cell for a named row."""
+    ipc = re.search(r"\bipc\s*[=:]\s*(\d+)\b", question, re.IGNORECASE)
+    steps = re.search(r"\b(\d+)-step\b", question, re.IGNORECASE)
+    question_key = _table_key(question)
+    value_terms = {term for term in re.findall(r"[a-z0-9]+", value_column.lower()) if len(term) >= 2}
+    scored: list[tuple[int, str]] = []
+    for record in records or []:
+        structure = record.get("table_structure") if isinstance(record.get("table_structure"), dict) else {}
+        columns = structure.get("columns") if isinstance(structure.get("columns"), list) else []
+        source_rows = [row for row in structure.get("rows") or [] if isinstance(row, dict)]
+        exact_row = any(_table_key(source_row.get("row_label")) == _table_key(row_key) for source_row in source_rows)
+        for source_row in source_rows:
+            source_key = _table_key(source_row.get("row_label"))
+            if not (source_key == _table_key(row_key) if exact_row else _row_matches_alias(row_key, [str(source_row.get("row_label") or "")])):
+                continue
+            source_values = source_row.get("values") if isinstance(source_row.get("values"), dict) else {}
+            if steps and not any(
+                re.search(r"\b(?:nfe|steps?)\b", str(column), re.IGNORECASE)
+                and str(source_values.get(column) or "").strip() == steps.group(1)
+                for column in columns
+            ):
+                continue
+            for column in columns:
+                column_text = str(column)
+                dataset = _table_key(re.split(r"/\s*(?:venue\s*)?ipc\b", column_text, maxsplit=1, flags=re.IGNORECASE)[0])
+                if ipc and dataset and len(dataset) >= 5 and dataset in question_key and re.search(rf"\bipc\s*[=:]\s*{re.escape(ipc.group(1))}\b", column_text, re.IGNORECASE):
+                    score = 100
+                else:
+                    column_terms = {term for term in re.findall(r"[a-z0-9]+", column_text.lower()) if len(term) >= 2}
+                    overlap = len(value_terms & column_terms)
+                    if not overlap:
+                        continue
+                    score = overlap * 10 + len(column_terms & {term for term in re.findall(r"[a-z0-9]+", question.lower()) if len(term) >= 3})
+                value = str(source_values.get(column) or "").strip()
+                if re.fullmatch(r"[-+]?\d+(?:\.\d+)?(?:\s*±\s*\d+(?:\.\d+)?)?", value):
+                    scored.append((score, value))
+    if not scored:
+        return None
+    best = max(score for score, _value in scored)
+    values = {value for score, value in scored if score == best}
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _structured_condition_rows(
+    question: str, row_key_column: str, value_column: str, existing_keys: set[str], records: list[dict[str, Any]] | None
+) -> list[dict[str, Any]]:
+    """Recover explicitly named ``w/ condition`` rows from one selected table."""
+    question_key = _table_key(question)
+    entities = [_table_key(alias) for alias in _question_table_aliases(question) if len(_table_key(alias)) >= 4]
+    recovered: dict[str, dict[str, Any]] = {}
+    for record in records or []:
+        structure = record.get("table_structure") if isinstance(record.get("table_structure"), dict) else {}
+        for source_row in structure.get("rows") or []:
+            if not isinstance(source_row, dict):
+                continue
+            label = str(source_row.get("row_label") or "")
+            suffix = re.search(r"\b(w/\s*.+)$", label, re.IGNORECASE)
+            label_key = _table_key(label)
+            if not suffix or not any(entity in label_key for entity in entities):
+                continue
+            output_key = suffix.group(1).strip()
+            key = _table_key(output_key)
+            condition_key = _table_key(re.sub(r"^w/\s*", "", output_key, flags=re.IGNORECASE))
+            if not key or key in existing_keys or not condition_key or condition_key not in question_key:
+                continue
+            value = _structured_table_value(question, label, value_column, [record])
+            if value is not None:
+                recovered[key] = {row_key_column: output_key, value_column: value}
+    return list(recovered.values())
+
+
 def postprocess_table_rows(
     rows: list[Any],
     schema: list[str] | None,
     input_example: dict[str, Any],
     candidate_records: list[dict[str, Any]] | None = None,
+    row_evidence_records: list[list[dict[str, Any]]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     columns = [str(column) for column in (schema or []) if str(column)]
     if not columns:
         return [row for row in rows if isinstance(row, dict)], []
     errors: list[str] = []
     normalized: list[dict[str, Any]] = []
-    for row in rows:
+    records_by_row_id: dict[int, list[dict[str, Any]]] = {}
+    for index, row in enumerate(rows):
         if not isinstance(row, dict):
             continue
         cleaned = {column: row.get(column) for column in columns}
         if any(value is not None and str(value).strip() for value in cleaned.values()):
             normalized.append(cleaned)
+            if row_evidence_records and index < len(row_evidence_records):
+                records_by_row_id[id(cleaned)] = row_evidence_records[index]
 
     if not normalized:
         return [], errors
 
-    row_key_column = columns[0]
+    row_key_columns = _table_row_key_columns(input_example, columns)
+    row_key_column = row_key_columns[0]
+    fake_condition = re.search(r"\bfake\s*(\d+)\s*-\s*contaminated\b", str(input_example.get("question") or ""), re.IGNORECASE)
+    if fake_condition:
+        required_fake = f"fake{fake_condition.group(1)}"
+        condition_rows = [row for row in normalized if required_fake in _table_key(row.get(row_key_column))]
+        if condition_rows:
+            normalized = condition_rows
+            errors.append("table_rows_filtered_to_explicit_fake_condition")
     title_by_key = _metadata_title_map(candidate_records)
     if "Paper Title" in columns and title_by_key:
         for row in normalized:
@@ -202,6 +305,13 @@ def postprocess_table_rows(
                     row["Paper Title"] = new_title
                     errors.append("table_paper_title_row_key_canonicalized")
     elif row_key_column:
+        budget_labels = {
+            _table_key(match.group(1)): f"{match.group(1)} ({match.group(2)})"
+            for match in re.finditer(
+                r"\b([A-Za-z][A-Za-z0-9-]{1,})\s*\(\s*with\s+(\d+(?:\.\d+)?[kKmMgG])\s+training\s+budget\s*\)",
+                str(input_example.get("question") or ""),
+            )
+        }
         aliases = sorted(
             _question_table_aliases(str(input_example.get("question") or "")),
             key=lambda value: len(_table_key(value)),
@@ -209,29 +319,132 @@ def postprocess_table_rows(
         )
         for row in normalized:
             old_value = row.get(row_key_column)
+            if fake_condition and required_fake in _table_key(old_value):
+                continue
+            # Generation occasionally emits a local paper id in a generic
+            # ``paper`` column.  It is not a question alias (e.g. ``ICCV``),
+            # and rewriting it before de-duplication collapses distinct rows.
+            if row_key_column.casefold() == "paper" and re.fullmatch(r"[A-Za-z]+20\d{2}_\d+", str(old_value).strip()):
+                detail = next((str(row.get(column) or "") for column in columns if column.casefold() == "detail"), "")
+                label = re.match(r"([A-Za-z][A-Za-z0-9]*)(?=[\s-]|$)", detail)
+                if label:
+                    row[row_key_column] = label.group(1)
+                    errors.append("table_internal_paper_id_replaced_by_detail_label")
+                continue
             old_key = _table_key(old_value)
             if not old_key:
                 continue
-            matches = [alias for alias in aliases if _row_matches_alias(old_value, [alias])]
+            explicit_budget = re.fullmatch(
+                r"\s*(.+?)\s*\(\s*with\s+(\d+(?:\.\d+)?[kKmMgG])\s+training\s+budget\s*\)\s*",
+                str(old_value),
+                re.IGNORECASE,
+            )
+            if explicit_budget:
+                row[row_key_column] = f"{explicit_budget.group(1).strip()} ({explicit_budget.group(2)})"
+                errors.append("table_explicit_budget_row_key_compacted")
+                continue
+            if old_key in budget_labels:
+                row[row_key_column] = budget_labels[old_key]
+                errors.append("table_question_budget_row_key_canonicalized")
+                continue
+            if old_key in {_table_key(label) for label in budget_labels.values()}:
+                continue
+            suffix = re.search(r"\b(w/\s*.+)$", str(old_value), re.IGNORECASE)
+            suffix_matches = [alias for alias in aliases if suffix and _row_matches_alias(suffix.group(1), [alias])]
+            if len(suffix_matches) == 1:
+                new_value = suffix.group(1).strip()
+                if _table_key(new_value) != old_key:
+                    row[row_key_column] = new_value
+                    errors.append("table_question_condition_suffix_canonicalized")
+                continue
+            # A short row label ("ECM") cannot safely stand in for a more
+            # specific budgeted target ("ECM-XL (102.4M)").  Only remove
+            # decorations from an already-present alias in that constrained
+            # case; ordinary method-name questions retain legacy matching.
+            matches = (
+                [alias for alias in aliases if _table_key(alias) in old_key]
+                if budget_labels else [alias for alias in aliases if _row_matches_alias(old_value, [alias])]
+            )
             if len(matches) != 1:
                 continue
             new_value = matches[0]
             new_key = _table_key(new_value)
-            if new_key != old_key and len(new_key) >= len(old_key):
+            if new_key in budget_labels:
+                new_value = budget_labels[new_key]
+                new_key = _table_key(new_value)
+            if new_key != old_key or str(new_value) != str(old_value):
                 row[row_key_column] = new_value
                 errors.append("table_question_alias_row_key_canonicalized")
 
     deduped: list[dict[str, Any]] = []
-    seen_keys: set[str] = set()
+    seen_keys: set[tuple[str, ...]] = set()
     for row in normalized:
-        key = _table_key(row.get(row_key_column))
-        if key and key in seen_keys:
+        key = _table_row_key(row, row_key_columns)
+        if not any(key):
+            errors.append("table_row_without_row_key_removed")
+            continue
+        if key in seen_keys:
             errors.append("table_duplicate_row_removed")
             continue
-        if key:
-            seen_keys.add(key)
+        seen_keys.add(key)
         deduped.append(row)
 
+    column_types = _table_column_types(input_example)
+    # A row's echoed evidence ref is the strongest numeric grounding signal.
+    # Recover only an unambiguous structured cell; otherwise retain Qwen's
+    # value and let the established global fallback below handle two-column rows.
+    for row in deduped:
+        records = records_by_row_id.get(id(row))
+        if not records:
+            continue
+        for value_column in columns:
+            if value_column in row_key_columns or column_types.get(value_column) != "number":
+                continue
+            value = _structured_table_value(
+                str(input_example.get("question") or ""), row.get(row_key_column), value_column, records
+            )
+            if value is not None and str(row.get(value_column) or "") != value:
+                row[value_column] = value
+                errors.append("table_numeric_value_recovered_from_row_evidence")
+
+    # A clean selected Docling table is more reliable than a model copying the
+    # wrong adjacent IPC column.  Keep this narrow: one row-key/value schema,
+    # an explicit IPC in the question, and exactly one matching table cell.
+    if len(columns) == 2 and row_key_column:
+        value_column = next(column for column in columns if column != row_key_column)
+        for row in deduped:
+            value = _structured_table_value(str(input_example.get("question") or ""), row.get(row_key_column), value_column, records_by_row_id.get(id(row)))
+            if value is None:
+                value = _structured_table_value(
+                    str(input_example.get("question") or ""), row.get(row_key_column), value_column, candidate_records
+                )
+            if value is not None and str(row.get(value_column) or "") != value:
+                row[value_column] = value
+                errors.append("table_value_recovered_from_selected_structure")
+        missing_rows = _structured_condition_rows(
+            str(input_example.get("question") or ""), row_key_column, value_column,
+            {_table_key(row.get(row_key_column)) for row in deduped}, candidate_records,
+        )
+        if missing_rows:
+            deduped.extend(missing_rows)
+            errors.append("table_rows_recovered_from_selected_structure")
+
+    # Official cells must honour the schema column types: number columns are
+    # coerced to JSON numbers (submission validator requires int/float) and
+    # string columns keep their verbatim text so "14.70" is not silently
+    # rewritten to 14.7.
+    for row in deduped:
+        for column, value in row.items():
+            if isinstance(value, str):
+                row[column] = re.sub(r"\s*±\s*", "±", value)
+            if column_types:
+                column_type = column_types.get(column)
+                if column_type == "number":
+                    row[column] = coerce_number_cell(row[column])
+                elif column_type == "boolean" and isinstance(row[column], str):
+                    lowered = str(row[column]).strip().lower()
+                    if lowered in {"true", "false"}:
+                        row[column] = lowered == "true"
     return deduped, errors
 
 
@@ -308,16 +521,33 @@ def validate_prediction_against_answer_contract(
         rows = rows if isinstance(rows, list) else []
         schema = (answer_contract.get("table") or {}).get("table_schema")
         plan_rows = _rows_from_table_answer_plan(prediction.get("table_answer_plan"), schema)
+        plan_row_records: list[list[dict[str, Any]]] | None = None
         if plan_rows:
             rows = plan_rows
             errors.append("table_rows_filled_from_table_answer_plan")
+            records_by_ref: dict[str, list[dict[str, Any]]] = {}
+            for record in candidate_records or []:
+                ref = str(record.get("evidence_ref") or "") if isinstance(record, dict) else ""
+                if ref:
+                    records_by_ref.setdefault(ref, []).append(record)
+            plan_row_records = []
+            for item in prediction.get("table_answer_plan") or []:
+                values = item.get("values") if isinstance(item, dict) and isinstance(item.get("values"), dict) else item
+                if isinstance(values, dict) and any(value is not None and str(value).strip() for value in values.values()):
+                    ref = str(item.get("row_evidence_ref") or item.get("evidence_ref") or "") if isinstance(item, dict) else ""
+                    plan_row_records.append(records_by_ref.get(ref, []))
+            if len(plan_row_records) != len(plan_rows):
+                plan_row_records = None
         if isinstance(schema, list) and schema:
+            schema_names = [str(column) for column in schema if str(column)]
             normalized_rows = []
             for row in rows:
                 source_row = row if isinstance(row, dict) else {}
-                normalized_rows.append({str(column): source_row.get(str(column)) for column in schema})
+                normalized_rows.append(remap_row_values(source_row, schema_names))
             rows = normalized_rows
-        rows, table_errors = postprocess_table_rows(rows, schema if isinstance(schema, list) else [], input_example or {}, candidate_records)
+        rows, table_errors = postprocess_table_rows(
+            rows, schema if isinstance(schema, list) else [], input_example or {}, candidate_records, plan_row_records
+        )
         errors.extend(table_errors)
         expected_row_count = int((answer_contract.get("table") or {}).get("expected_row_count") or 0)
         if expected_row_count > 0 and len(rows) > expected_row_count:
@@ -602,24 +832,8 @@ def _evidence_text(evidence: object) -> str:
 
 
 def _is_multi_paper_task(input_example: dict[str, Any], answer_contract: dict[str, Any] | None = None) -> bool:
-    task_family = str(input_example.get("task_family") or "").lower()
-    if "multi" in task_family:
-        return True
-    contract = answer_contract or extract_answer_contract(input_example)
-    answer_types = {str(item) for item in contract.get("answer_types", [])}
-    if "table" in answer_types:
-        return True
-    question = str(input_example.get("question") or "").lower()
-    patterns = [
-        r"\bacross (?:all|the) papers\b",
-        r"\bwhich .* papers\b",
-        r"\bwhat .* each\b",
-        r"\blist\b.*\bpapers?\b",
-        r"\bcompare[sd]?\b",
-        r"\bamong\b.*\bpapers?\b",
-        r"\brespectively\b",
-    ]
-    return any(re.search(pattern, question) for pattern in patterns)
+    """Compatibility wrapper around the shared query-visible router."""
+    return derive_task_structure(input_example).is_multi_paper
 
 
 def _label_to_locator(source_type: str, label: Any) -> dict[str, Any]:
@@ -690,6 +904,17 @@ def _coerce_table_value(value: Any) -> Any:
     return value
 
 
+def _table_column_types(input_example: dict[str, Any] | None) -> dict[str, str]:
+    """Map official schema column name -> type from the raw input row."""
+    result: dict[str, str] = {}
+    schema = (input_example or {}).get("table_schema")
+    if isinstance(schema, list):
+        for column in schema:
+            if isinstance(column, dict) and str(column.get("name") or ""):
+                result[str(column["name"])] = str(column.get("type") or "string")
+    return result
+
+
 def _rows_from_table_answer_plan(value: Any, schema: list[str] | None) -> list[dict[str, Any]]:
     if not isinstance(value, list):
         return []
@@ -701,12 +926,9 @@ def _rows_from_table_answer_plan(value: Any, schema: list[str] | None) -> list[d
         values = item.get("values") if isinstance(item.get("values"), dict) else item
         if not isinstance(values, dict):
             continue
-        by_normalized = {_normalize_column_name(key): values.get(key) for key in values}
         if columns:
-            row = {
-                column: _coerce_table_value(values[column] if column in values else by_normalized.get(_normalize_column_name(column)))
-                for column in columns
-            }
+            remapped = remap_row_values(values, columns)
+            row = {column: remapped.get(column) for column in columns}
         else:
             row = {str(key): _coerce_table_value(val) for key, val in values.items() if key not in {"row_source", "source", "evidence"}}
         if any(value is not None and str(value).strip() for value in row.values()):
@@ -740,6 +962,20 @@ def _evidence_from_table_answer_plan(value: Any, candidate_set: set[str]) -> lis
         locator.update(_label_to_locator(source_type, source.get("label") or source.get("table_id")))
         evidence.append({"paper_id": paper_id, "source_type": source_type, "locator": locator})
     return evidence
+
+
+def _table_plan_evidence_refs(value: Any) -> list[str]:
+    """Extract model-echoed row refs so plans bind to selected evidence."""
+    if not isinstance(value, list):
+        return []
+    refs: list[str] = []
+    for row in value:
+        if not isinstance(row, dict):
+            continue
+        ref = str(row.get("row_evidence_ref") or row.get("evidence_ref") or "").strip()
+        if ref and ref not in refs:
+            refs.append(ref)
+    return refs
 
 
 def _selected_evidence_text(evidence: dict[str, Any]) -> str:
@@ -816,6 +1052,19 @@ def _locator_from_selected_evidence(evidence: dict[str, Any], source_type: str |
                     if locator.get(id_key) not in {None, ""}:
                         clean[id_key] = locator.get(id_key)
                 return clean
+    selected_source_type = to_official_source_type(source_type=str(evidence.get("source_type") or "")) or ""
+    if not source_type or selected_source_type == to_official_source_type(source_type=source_type):
+        locator = evidence.get("locator") if isinstance(evidence.get("locator"), dict) else {}
+        try:
+            page = int(locator.get("page", evidence.get("page")))
+        except (TypeError, ValueError):
+            page = 0
+        if page > 0:
+            clean = {"page": page}
+            for id_key in ("table_id", "figure_id", "equation_id", "algorithm_id", "citation_id", "reference_id"):
+                if locator.get(id_key) not in {None, ""}:
+                    clean[id_key] = locator[id_key]
+            return clean
     locator: dict[str, Any] = {}
     try:
         locator["page"] = int(evidence.get("page"))
@@ -841,10 +1090,11 @@ def _best_symbolic_evidence(
     predicted_paper_ids: list[str],
     raw_evidence: dict[str, Any] | None,
     selected_evidence: list[dict[str, Any]],
-    primary_evidence_type: str,
+    preferred_source_types: Any,
 ) -> dict[str, Any] | None:
     if not selected_evidence:
         return None
+    preferred = set(as_source_types(preferred_source_types))
     predicted_set = {paper_id for paper_id in predicted_paper_ids if paper_id}
     raw_paper_id = str((raw_evidence or {}).get("paper_id") or "")
     raw_source_type = to_official_source_type(source_type=str((raw_evidence or {}).get("source_type") or "")) or ""
@@ -871,9 +1121,9 @@ def _best_symbolic_evidence(
     best: tuple[float, dict[str, Any]] | None = None
     for index, item in enumerate(candidates):
         score = _token_overlap_score(evidence_query, _selected_evidence_text(item))
-        if primary_evidence_type and str(item.get("source_type") or "") == primary_evidence_type:
+        if str(item.get("source_type") or "") in preferred:
             score += 1.2
-        if primary_evidence_type and _hint_for_source_type(item, primary_evidence_type):
+        if any(_hint_for_source_type(item, source_type) for source_type in preferred):
             score += 0.9
         if raw_source_type and str(item.get("source_type") or "") == raw_source_type:
             score += 1.0
@@ -909,7 +1159,7 @@ def standardize_symbolic_evidence(
         for item in prediction.get("gold_papers", [])
         if isinstance(item, dict) and item.get("paper_id")
     ]
-    primary_type = to_official_source_type(source_type=str(input_example.get("primary_evidence_type") or "")) or "text_span"
+    preferred_types = derive_task_structure(input_example).preferred_source_types
     query_text = " ".join([str(input_example.get("question") or ""), _answer_text(prediction.get("answer"))]).strip()
     raw_evidence = prediction.get("evidence") if isinstance(prediction.get("evidence"), list) else []
     standardized: list[dict[str, Any]] = []
@@ -935,17 +1185,20 @@ def standardize_symbolic_evidence(
                 standardized.append({"paper_id": paper_id, "source_type": source_type, "locator": {"page": page, **{k: v for k, v in locator.items() if k != "page" and v}}})
             continue
 
-        best = _best_symbolic_evidence(query_text, predicted_ids, item, selected, primary_type)
+        best = _best_symbolic_evidence(query_text, predicted_ids, item, selected, preferred_types)
         if not best:
-            best = _best_symbolic_evidence(query_text, [], None, selected, primary_type)
+            best = _best_symbolic_evidence(query_text, [], None, selected, preferred_types)
         if not best:
             errors.append("symbolic_evidence_standardization_no_match")
             continue
-        best_source_type = str(best.get("source_type") or primary_type)
+        best_source_type = str(best.get("source_type") or (preferred_types[0] if preferred_types else "text_span"))
         if raw_item_source_type and _hint_for_source_type(best, raw_item_source_type):
             best_source_type = raw_item_source_type
-        elif primary_type and _hint_for_source_type(best, primary_type):
-            best_source_type = primary_type
+        elif preferred_types:
+            for source_type in preferred_types:
+                if _hint_for_source_type(best, source_type):
+                    best_source_type = source_type
+                    break
         locator = _locator_from_selected_evidence(best, best_source_type)
         if not locator:
             errors.append("symbolic_evidence_standardization_no_locator")
@@ -961,13 +1214,15 @@ def standardize_symbolic_evidence(
         errors.append("symbolic_evidence_locator_standardized")
 
     if not standardized:
-        best = _best_symbolic_evidence(query_text, predicted_ids, None, selected, primary_type)
+        best = _best_symbolic_evidence(query_text, predicted_ids, None, selected, preferred_types)
         if not best:
-            best = _best_symbolic_evidence(query_text, [], None, selected, primary_type)
+            best = _best_symbolic_evidence(query_text, [], None, selected, preferred_types)
         if best:
-            best_source_type = str(best.get("source_type") or primary_type)
-            if primary_type and _hint_for_source_type(best, primary_type):
-                best_source_type = primary_type
+            best_source_type = str(best.get("source_type") or (preferred_types[0] if preferred_types else "text_span"))
+            for source_type in preferred_types:
+                if _hint_for_source_type(best, source_type):
+                    best_source_type = source_type
+                    break
             locator = _locator_from_selected_evidence(best, best_source_type)
             if locator:
                 standardized.append(
@@ -1092,7 +1347,17 @@ def normalize_prediction(
         errors.append({"query_id": query_id, "type": "fallback_paper_id", "replacement": top1})
         normalized_papers = [{"paper_id": top1}]
 
-    raw_evidence, echo_errors = _resolve_evidence_ref_echo(obj, selected_evidence)
+    # A table row's evidence ref is an answer claim just like a top-level
+    # evidence ref.  Previously it was ignored unless the model redundantly
+    # echoed it at top level, leaving valid table plans ungrounded.
+    table_plan_refs = _table_plan_evidence_refs(table_answer_plan)
+    if table_plan_refs:
+        evidence_obj = dict(obj)
+        existing_refs = obj.get("evidence_refs") if isinstance(obj.get("evidence_refs"), list) else []
+        evidence_obj["evidence_refs"] = [*existing_refs, *table_plan_refs]
+    else:
+        evidence_obj = obj
+    raw_evidence, echo_errors = _resolve_evidence_ref_echo(evidence_obj, selected_evidence)
     for error_type in echo_errors:
         errors.append({"query_id": query_id, "type": error_type})
     if isinstance(raw_evidence, list) and contribution_evidence:
@@ -1125,7 +1390,9 @@ def normalize_prediction(
             if paper_id and paper_id in candidate_set and {"paper_id": paper_id} not in pred["gold_papers"]:
                 pred["gold_papers"].append({"paper_id": paper_id})
                 errors.append({"query_id": query_id, "type": "gold_paper_filled_from_evidence", "paper_id": paper_id})
-    pred, answer_errors = validate_prediction_against_answer_contract(pred, contract, input_example, candidate_records)
+    pred, answer_errors = validate_prediction_against_answer_contract(
+        pred, contract, input_example, [*(candidate_records or []), *(selected_evidence or [])]
+    )
     answer_errors.extend(_maybe_rerank_structured_multiple_choice(pred, contract, input_example, selected_evidence))
     for error_type in locator_errors + answer_errors:
         errors.append({"query_id": query_id, "type": error_type})

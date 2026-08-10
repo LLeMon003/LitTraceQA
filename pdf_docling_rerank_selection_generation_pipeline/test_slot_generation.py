@@ -12,6 +12,9 @@ from .slot_generation import (
     bind_composition_support,
     deterministic_count_extraction,
     ensure_slot_cards,
+    plan_augmented_rerank_query,
+    plan_package_routes,
+    plan_paper_package_routes,
     slot_cards,
     slot_composition_messages,
     slot_extraction_messages,
@@ -42,17 +45,166 @@ class SlotGenerationTests(unittest.TestCase):
             }],
         }
 
-    def test_plan_removes_paper_scope_and_keeps_typed_slot(self) -> None:
+    def test_plan_ignores_legacy_paper_scope_and_keeps_typed_slot(self) -> None:
         plan, audit = validate_slot_plan({"slots": [{
             "role": "direct_answer", "operation": "direct", "paper_scope": ["paper", "unknown"],
             "required_source_types": ["table", "bad"], "entities": ["Method A"],
             "required_conditions": ["F1", "Set X"],
         }]}, self.sample)
         self.assertFalse(plan["fallback"])
-        self.assertEqual(plan["slots"][0]["paper_scope"], [])
+        self.assertNotIn("paper_scope", plan["slots"][0])
         self.assertEqual(plan["slots"][0]["required_source_types"], ["table"])
         self.assertEqual(audit[0]["status"], "slot_accepted")
-        self.assertTrue(audit[0]["paper_scope_removed"])
+        self.assertTrue(audit[0]["legacy_paper_scope_ignored"])
+
+    def test_plan_accepts_literal_as_direct_operation(self) -> None:
+        plan, audit = validate_slot_plan({"slots": [{
+            "role": "direct_answer", "operation": "literal", "required_source_types": ["equation_algorithm"],
+            "entities": ["RomanTex"], "required_conditions": [],
+        }]}, self.sample)
+        self.assertEqual(plan["slots"][0]["operation"], "direct")
+        self.assertEqual(audit[0]["status"], "slot_accepted")
+
+    def test_package_routes_keep_each_slot_source_type_and_do_not_use_paper_scope(self) -> None:
+        routes = plan_package_routes({"slots": [
+            {"id": "S001", "paper_scope": ["leaky"], "required_source_types": ["table"], "entities": ["Method A"], "required_conditions": ["F1"]},
+            {"id": "S002", "required_source_types": ["figure"], "entities": ["Method B"], "required_conditions": ["architecture"]},
+        ]}, "Compare Method A and Method B")
+        self.assertEqual(routes, [
+            {"slot_id": "S001", "record_types": ["table"], "query": "table Method A F1"},
+            {"slot_id": "S002", "record_types": ["figure"], "query": "figure Method B architecture"},
+        ])
+
+    def test_package_route_keeps_explicit_parenthetical_entity_condition(self) -> None:
+        routes = plan_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["table"],
+            "entities": ["ECM-XL (100k iterations)"], "required_conditions": ["CIFAR-10"],
+        }]}, "What is ECM-XL (100k iterations) on CIFAR-10?")
+        self.assertEqual(routes, [
+            {"slot_id": "S001", "record_types": ["table"], "query": "table ECM-XL (100k iterations) CIFAR-10"},
+            {"slot_id": "S001", "record_types": ["table"], "query": "table ECM-XL 100k iterations", "catalog_fallback": True},
+        ])
+
+    def test_package_route_uses_catalog_fallback_for_long_literal_condition_list(self) -> None:
+        routes = plan_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["table"], "entities": ["Kitchen"],
+            "required_conditions": ["SUN RGB-D", "ARKitScenes", "Hypersim", "Objectron"],
+        }]}, "What is Kitchen across these datasets?")
+        self.assertEqual(routes, [{
+            "slot_id": "S001", "record_types": ["table"],
+            "query": "table Kitchen SUN RGB-D ARKitScenes Hypersim Objectron", "catalog_fallback": True,
+        }])
+
+    def test_paper_package_route_requires_one_distinctive_literal_title_match(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["equation_algorithm"],
+            "entities": ["RomanTex", "NeRF"], "required_conditions": ["rotation matrix"],
+        }]}, [
+            {"paper_id": "roman", "title": "RomanTex: Rotary Positional Encoding for Textures"},
+            {"paper_id": "nerf", "title": "NeRF Editing"},
+        ])
+        self.assertEqual(routes, [{
+            "slot_id": "S001", "paper_id": "roman", "record_types": ["equation_algorithm"],
+            "query": "equation_algorithm RomanTex rotation matrix",
+        }])
+
+    def test_paper_package_route_binds_unique_short_title_initialism(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["table"],
+            "entities": ["TCM"], "required_conditions": ["CIFAR-10"],
+        }]}, [
+            {"paper_id": "tcm", "title": "Truncated Consistency Models"},
+            {"paper_id": "other", "title": "Consistency Models Made Easy"},
+        ])
+        self.assertEqual(routes, [{
+            "slot_id": "S001", "paper_id": "tcm", "record_types": ["table"],
+            "query": "table TCM CIFAR-10",
+        }])
+
+    def test_paper_package_route_binds_initialism_after_generic_title_prefix(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["table"], "entities": ["NCFM", "ATT", "DEDA"],
+            "required_conditions": ["Tiny ImageNet"],
+        }]}, [
+            {"paper_id": "ncfm", "title": "Dataset Distillation with Neural Characteristic Function: A Minmax Perspective"},
+            {"paper_id": "att", "title": "Dataset Distillation by Automatic Training Trajectories"},
+            {"paper_id": "deda", "title": "Diversity-Enhanced Distribution Alignment for Dataset Distillation"},
+            {"paper_id": "distractor", "title": "AegisGuard: RL-Guided Adapter Tuning"},
+        ])
+        self.assertEqual([route["paper_id"] for route in routes], ["ncfm", "att", "deda"])
+
+    def test_paper_package_route_binds_unique_one_letter_hyphenated_method_typo(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["table"], "entities": ["AP-BPTT"],
+            "required_conditions": ["Tiny ImageNet"],
+        }]}, [{
+            "paper_id": "at_bptt", "title": "Beyond Random", "abstract": "We propose AT-BPTT.",
+        }])
+        self.assertEqual(routes, [{
+            "slot_id": "S001", "paper_id": "at_bptt", "record_types": ["table"],
+            "query": "table AP-BPTT Tiny ImageNet",
+        }])
+
+    def test_paper_package_route_binds_unique_short_colon_title(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["table"],
+            "entities": ["MoST"], "required_conditions": ["ModelNet40"],
+        }]}, [
+            {"paper_id": "most", "title": "MoST: Efficient Sparse Tuning"},
+            {"paper_id": "other", "title": "Most Efficient Tuning"},
+        ])
+        self.assertEqual(routes, [{
+            "slot_id": "S001", "paper_id": "most", "record_types": ["table"],
+            "query": "table MoST ModelNet40",
+        }])
+
+    def test_paper_package_route_uses_unique_title_overlap_and_citation_text(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["citation_context"],
+            "entities": ["BRIDGE multi-view clustering paper"], "required_conditions": ["ICCV 2025", "APADC"],
+        }]}, [
+            {"paper_id": "iccv2025_00038", "title": "A Unified Framework to BRIDGE Complete and Incomplete Deep Multi-View Clustering"},
+            {"paper_id": "iccv2025_00519", "title": "Deep Incomplete Multi-view Clustering with Distribution Recovery"},
+        ])
+        self.assertEqual(routes, [{
+            "slot_id": "S001", "paper_id": "iccv2025_00038", "record_types": ["citation_context", "text_span"],
+            "query": "citation_context BRIDGE multi-view clustering paper ICCV 2025 APADC",
+        }])
+
+    def test_paper_package_route_does_not_bind_generic_description_by_title_overlap(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["text_span"],
+            "entities": ["Gaussian splatting editing"], "required_conditions": [],
+        }]}, [{
+            "paper_id": "gaussian", "title": "NeRF Editing with Gaussian Splatting",
+        }])
+        self.assertEqual(routes, [])
+
+    def test_paper_package_route_uses_single_question_venue_to_disambiguate_title(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["text_span"],
+            "entities": ["DisCo"], "required_conditions": ["token reduction"],
+        }]}, [
+            {"paper_id": "iccv2025_00591", "title": "DisCo: Visual Encapsulation in Video MLLMs"},
+            {"paper_id": "neurips2025_01146", "title": "DISCO: Discrete Noise for Conditional Control"},
+        ], "Across these ICCV 2025 papers, report the DisCo result.")
+        self.assertEqual(routes, [{
+            "slot_id": "S001", "paper_id": "iccv2025_00591", "record_types": ["text_span"],
+            "query": "text_span DisCo token reduction",
+        }])
+
+    def test_paper_package_route_uses_unique_exact_method_name_in_abstract(self) -> None:
+        routes = plan_paper_package_routes({"slots": [{
+            "id": "S001", "required_source_types": ["equation_algorithm"],
+            "entities": ["ERASE"], "required_conditions": ["update expression"],
+        }]}, [
+            {"paper_id": "erase", "title": "Language Modeling with Editable External Knowledge", "abstract": "We introduce ERASE for editable knowledge."},
+            {"paper_id": "other", "title": "Other paper", "abstract": "No named method here."},
+        ])
+        self.assertEqual(routes, [{
+            "slot_id": "S001", "paper_id": "erase", "record_types": ["equation_algorithm"],
+            "query": "equation_algorithm ERASE update expression",
+        }])
 
     def test_plan_drops_paper_identity_conditions(self) -> None:
         plan, audit = validate_slot_plan({"slots": [{
@@ -137,6 +289,19 @@ class SlotGenerationTests(unittest.TestCase):
         self.assertEqual(len(accepted["table_rows"]), 2)
         self.assertEqual(accepted["table_rows"][0]["values"]["Method Name"], "LOGO")
         self.assertEqual(accepted["table_rows"][1]["values"]["Training Objective Equation ID"], "Equation 8")
+
+    def test_table_rows_remap_variant_columns_to_schema(self) -> None:
+        schema = ["dataset", "ndcg_at_10", "map_at_10"]
+        accepted, _ = validate_slot_extraction({
+            "slot_id": "S001", "status": "supported", "value": None, "support_keys": ["C001"],
+            "table_rows": [
+                {"values": {"dataset": "SciFact", "NDCG@10": "62.5", "MAP@10": "31.0"}, "support_keys": ["C001"]},
+            ],
+        }, {"id": "S001", "operation": "list", "required_source_types": ["table"]}, self.hierarchy, table_schema=schema)
+        values = accepted["table_rows"][0]["values"]
+        self.assertEqual(values.get("ndcg_at_10"), "62.5")
+        self.assertEqual(values.get("map_at_10"), "31.0")
+        self.assertNotIn("NDCG@10", values)
 
     def _citation_hierarchy(self, records: list[dict]) -> dict:
         return {
@@ -327,6 +492,130 @@ class SlotGenerationTests(unittest.TestCase):
         text = slot_plan_messages(self.sample, {"answer_types": ["freeform"]})[-1]["content"]
         self.assertNotIn("candidate_papers", text)
         self.assertNotIn("Paper", text)
+        self.assertNotIn("task_family", text)
+        self.assertNotIn("primary_evidence_type", text)
+        self.assertIn("query_analysis", text)
+        self.assertIn("inferred_paper_count", text)
+
+    def test_plan_prompt_excludes_gold_shaped_fields_for_new_format_sample(self) -> None:
+        sample = {
+            "query_id": "q_001",
+            "question": "Compare the two methods.",
+            "answer_types": ["freeform"],
+        }
+        text = slot_plan_messages(sample, {"answer_types": ["freeform"]})[-1]["content"]
+        self.assertNotIn("task_family", text)
+        self.assertNotIn("primary_evidence_type", text)
+
+    def test_validate_slot_plan_keeps_structured_query_analysis(self) -> None:
+        plan, audit = validate_slot_plan({
+            "slots": [{
+                "role": "direct_answer", "operation": "difference",
+                "required_source_types": ["table"], "entities": ["IMM", "D-FINE"],
+                "required_conditions": ["F1"],
+            }],
+            "query_analysis": {
+                "entities": ["IMM", "D-FINE"],
+                "comparison_targets": ["IMM", "D-FINE"],
+                "inferred_paper_count": 2,
+                "cross_paper_synthesis_required": True,
+            },
+        }, {"query_id": "q", "question": "Compare IMM and D-FINE.", "answer_types": ["freeform"]})
+        self.assertFalse(plan["fallback"])
+        self.assertTrue(plan["requires_cross_paper_synthesis"])
+        self.assertEqual(plan["query_analysis"]["inferred_paper_count"], 2)
+        self.assertEqual(plan["query_analysis"]["comparison_targets"], ["IMM", "D-FINE"])
+
+    def test_cross_paper_list_plan_splits_entities_into_slots(self) -> None:
+        plan, audit = validate_slot_plan({
+            "slots": [{
+                "role": "direct_answer", "operation": "list", "required_source_types": ["table"],
+                "entities": ["Method A", "Method B"], "required_conditions": [],
+            }],
+            "query_analysis": {"inferred_paper_count": 2},
+        }, {"query_id": "q", "question": "Compare Method A and Method B.", "answer_types": ["table"]})
+        self.assertEqual([slot["entities"] for slot in plan["slots"]], [["Method A"], ["Method B"]])
+        self.assertTrue(any(row.get("status") == "cross_paper_list_slot_split" for row in audit))
+
+    def test_across_papers_list_is_split_even_when_llm_omits_cross_flag(self) -> None:
+        plan, _ = validate_slot_plan({"slots": [{
+            "role": "direct_answer", "operation": "list", "required_source_types": ["text_span"],
+            "entities": ["DisCo", "DiTFastAttnV2", "DLFR-Gen"], "required_conditions": [],
+        }], "requires_cross_paper_synthesis": False, "query_analysis": {
+            "entities": ["DisCo", "DiTFastAttnV2", "DLFR-Gen"], "comparison_targets": [],
+            "inferred_paper_count": None, "cross_paper_synthesis_required": False,
+        }}, {"query_id": "q", "question": "Across these efficiency papers, report each headline claim.", "answer_types": ["table"]})
+        self.assertTrue(plan["requires_cross_paper_synthesis"])
+        self.assertEqual([slot["entities"] for slot in plan["slots"]], [["DisCo"], ["DiTFastAttnV2"], ["DLFR-Gen"]])
+
+    def test_validate_slot_plan_deterministic_routing_overrides_llm_flag(self) -> None:
+        plan, audit = validate_slot_plan({
+            "slots": [{
+                "role": "direct_answer", "operation": "difference",
+                "required_source_types": ["table"], "entities": ["A", "B"],
+                "required_conditions": [],
+            }],
+            "requires_cross_paper_synthesis": False,
+            "query_analysis": {
+                "entities": ["A", "B"],
+                "comparison_targets": ["A", "B"],
+                "inferred_paper_count": 1,
+                "cross_paper_synthesis_required": False,
+            },
+        }, {"query_id": "q", "question": "Compare A and B.", "answer_types": ["freeform"]})
+        self.assertTrue(plan["requires_cross_paper_synthesis"])
+        self.assertTrue(any(row.get("status") == "cross_paper_routing_deterministic" for row in audit))
+
+    def test_validate_slot_plan_fills_source_types_from_query_contract(self) -> None:
+        plan, audit = validate_slot_plan({
+            "slots": [{
+                "role": "direct_answer", "operation": "direct",
+                "required_source_types": [], "entities": ["value"],
+                "required_conditions": [],
+            }],
+            "query_analysis": {},
+        }, {"query_id": "q", "question": "Report the value in Table 2.", "answer_types": ["freeform"]})
+        self.assertIn("table", plan["slots"][0]["required_source_types"])
+
+    def test_table_output_contract_does_not_override_slot_source_type(self) -> None:
+        plan, audit = validate_slot_plan({"slots": [{
+            "role": "direct_answer", "operation": "direct",
+            "required_source_types": ["equation"], "entities": ["loss"],
+            "required_conditions": [],
+        }], "query_analysis": {}}, {
+            "query_id": "q", "question": "Report the loss.", "answer_types": ["table"],
+        })
+        self.assertEqual(plan["slots"][0]["required_source_types"], ["equation_algorithm"])
+        self.assertFalse(any(row.get("status") == "slot_contract_aligned_table" for row in audit))
+
+    def test_slot_explicit_object_corrects_generic_text_plan(self) -> None:
+        plan, audit = validate_slot_plan({"slots": [{
+            "role": "direct_answer", "operation": "direct",
+            "required_source_types": ["text_span"], "entities": ["Training Objective Equation ID"],
+            "required_conditions": [],
+        }], "query_analysis": {}}, {
+            "query_id": "q", "question": "Which method is used in Equation 4?", "answer_types": ["table"],
+        })
+        self.assertEqual(plan["slots"][0]["required_source_types"], ["equation_algorithm"])
+        self.assertTrue(any(row.get("status") == "slot_source_type_explicitly_corrected" for row in audit))
+
+    def test_fallback_plan_includes_query_analysis(self) -> None:
+        plan, audit = validate_slot_plan({"slots": []}, {
+            "query_id": "q", "question": "Compare A and B across papers.", "answer_types": ["freeform"],
+        })
+        self.assertTrue(plan["fallback"])
+        self.assertTrue(plan["requires_cross_paper_synthesis"])
+        self.assertEqual(plan["query_analysis"]["inferred_paper_count"], 2)
+        self.assertEqual(audit[-1]["status"], "slot_plan_fallback")
+
+    def test_plan_augmented_rerank_query_appends_slot_terms(self) -> None:
+        plan = {"slots": [{"entities": ["MCTS", "ICAE"], "required_conditions": ["NAACL 2025", "F1"]}]}
+        query = plan_augmented_rerank_query(plan, "Which papers mention MCTS?")
+        self.assertTrue(query.startswith("Which papers mention MCTS?"))
+        self.assertIn("NAACL 2025", query)
+        self.assertIn("F1", query)
+        # Deduplicated: repeated terms appear once.
+        self.assertEqual(query.count("MCTS"), 2)  # question + entity
 
     def test_extraction_requires_visible_key_matching_type_and_number(self) -> None:
         slot = {"id": "S001", "required_source_types": ["table"]}
@@ -589,6 +878,20 @@ class SlotGenerationTests(unittest.TestCase):
             candidates=[{"paper_id": "named", "title": "Named Paper"}, {"paper_id": "other", "title": "Other Work"}],
         )
         self.assertEqual(cards[0]["paper_key"], "P01")
+
+    def test_routed_paper_id_filters_slot_cards(self) -> None:
+        hierarchy = {**self.hierarchy, "l0_catalog": [
+            {**self.hierarchy["l0_catalog"][0], "paper_id": "target"},
+            {**self.hierarchy["l0_catalog"][0], "evidence_ref": "E0002", "global_record_id": "other::r1", "paper_id": "other", "text": "Other equation f(x)=9."},
+        ], "l2_evidence_cards": [
+            {"support_refs": ["E0001"], "proposition": "Target equation f(x)=1."},
+            {"support_refs": ["E0002"], "proposition": "Other equation f(x)=9."},
+        ]}
+        cards = slot_cards(
+            {"required_source_types": ["table"], "routed_paper_id": "target"}, hierarchy, "What is the equation?"
+        )
+        self.assertTrue(cards)
+        self.assertTrue(all(card.get("paper_key") == "P01" for card in cards))
 
     def test_slot_images_are_limited_to_its_visible_cards(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

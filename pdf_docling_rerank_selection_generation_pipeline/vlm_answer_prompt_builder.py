@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from .data_io import extract_answer_contract
-from .evidence_hierarchy import hierarchy_prompt_projection, keyed_hierarchy_prompt_projection
+from .evidence_hierarchy import _table_view, hierarchy_prompt_projection, keyed_hierarchy_prompt_projection
+from .metadata_index import tokenize
 from .table_structure import table_text_to_structure
+from .task_structure import as_source_types, derive_task_structure
 
 
 SYSTEM_PROMPT = (
@@ -108,25 +110,6 @@ def _query_answer_style_guidance(input_example: dict[str, Any], contract: dict[s
     return guidance
 
 
-def _is_multi_paper_task(input_example: dict[str, Any], contract: dict[str, Any]) -> bool:
-    task_family = str(input_example.get("task_family") or "").lower()
-    if "multi" in task_family:
-        return True
-    question = str(input_example.get("question") or "").lower()
-    if "table" in [str(item) for item in contract.get("answer_types", [])]:
-        return True
-    patterns = [
-        r"\bacross (?:all|the) papers\b",
-        r"\bwhich .* papers\b",
-        r"\bwhat .* each\b",
-        r"\blist\b.*\bpapers?\b",
-        r"\bcompare[sd]?\b",
-        r"\bamong\b.*\bpapers?\b",
-        r"\brespectively\b",
-    ]
-    return any(re.search(pattern, question) for pattern in patterns)
-
-
 def _project_candidate_for_prompt(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
         "paper_id": candidate.get("paper_id"),
@@ -143,8 +126,7 @@ def _project_evidence_for_prompt(evidence: dict[str, Any], contract: dict[str, A
         "text": evidence.get("text"),
     }
     if projected["source_type"] == "table":
-        table_schema = ((contract or {}).get("table") or {}).get("table_schema") or []
-        table_structure = evidence.get("table_structure") if isinstance(evidence.get("table_structure"), dict) else table_text_to_structure(str(evidence.get("text") or ""), table_schema)
+        table_structure = evidence.get("table_structure") if isinstance(evidence.get("table_structure"), dict) else table_text_to_structure(str(evidence.get("text") or ""))
         if table_structure:
             projected["table_structure"] = table_structure
     if isinstance(evidence.get("grounding_label"), dict):
@@ -204,8 +186,11 @@ def _build_evidence_packets(
     selected_evidence: list[dict[str, Any]],
     candidate_records: list[dict[str, Any]],
     contract: dict[str, Any],
-    primary_evidence_type: str,
+    preferred_source_types: Sequence[str],
+    query: str,
 ) -> list[dict[str, Any]]:
+    preferred = set(as_source_types(preferred_source_types))
+    query_terms = set(tokenize(query))
     candidate_by_id = {str(candidate.get("paper_id") or ""): _project_candidate_for_prompt(candidate) for candidate in candidate_records}
     records_by_paper: dict[str, list[dict[str, Any]]] = {}
     for evidence in selected_evidence:
@@ -250,11 +235,13 @@ def _build_evidence_packets(
             if isinstance(primary.get("source_type_hints"), list) and primary.get("source_type_hints"):
                 packet["source_type_hints"] = primary.get("source_type_hints")
             if source_type == "table":
-                table_schema = (contract.get("table") or {}).get("table_schema") or []
-                table_structure = primary.get("table_structure") if isinstance(primary.get("table_structure"), dict) else table_text_to_structure(str(primary.get("text") or ""), table_schema)
+                table_structure = primary.get("table_structure") if isinstance(primary.get("table_structure"), dict) else table_text_to_structure(str(primary.get("text") or ""))
                 if table_structure:
                     packet["table_structure"] = table_structure
-            packet["_rank_source_type_match"] = source_type == primary_evidence_type
+                    table_view = _table_view(str(primary.get("text") or ""), query_terms, table_structure)
+                    if table_view:
+                        packet["table_view"] = table_view
+            packet["_rank_source_type_match"] = source_type in preferred
             packet_rows.append(packet)
 
         packet_rows.sort(
@@ -301,6 +288,14 @@ def _required_answer_shape(contract: dict[str, Any]) -> dict[str, Any]:
     return shape
 
 
+def _table_plan_shape(columns: Sequence[str], *, keyed: bool) -> dict[str, Any]:
+    """Show the model the actual public column names, never placeholders."""
+    row = {str(column): "<value>" for column in columns if str(column)}
+    if keyed:
+        return {"row_support_key": "C001", "values": row}
+    return {"row_evidence_ref": "<input evidence_ref>", "values": row}
+
+
 def _compact_evidence_ledger(selected_evidence: list[dict[str, Any]]) -> str:
     """Serialize selected evidence once, with provenance kept in the caller.
 
@@ -345,12 +340,21 @@ def build_symbolic_answer_prompt(
     parser_model: str = "",
     answer_model: str = "",
     answer_contract: dict[str, Any] | None = None,
+    multi_paper_task: bool | None = None,
+    preferred_source_types: Sequence[str] | None = None,
 ) -> list[dict[str, str]]:
     contract = answer_contract or extract_answer_contract(input_example)
     required_answer_fields = [str(item) for item in contract.get("answer_types", [])]
     required_answer_shape = _required_answer_shape(contract)
     answer_style_guidance = _query_answer_style_guidance(input_example, contract)
-    multi_paper_task = _is_multi_paper_task(input_example, contract)
+    if multi_paper_task is None:
+        multi_paper_task = derive_task_structure(input_example).is_multi_paper
+    if preferred_source_types is None:
+        preferred_source_types = derive_task_structure(input_example).preferred_source_types
+    table_schema = [
+        column.get("name") if isinstance(column, dict) else column
+        for column in ((contract.get("table") or {}).get("table_schema") or [])
+    ]
     # A long multi-paper response previously repeated provenance in both
     # evidence and contributing_papers, which can exhaust the completion budget
     # before JSON closes. Evidence is an audit trail, not a transcript.
@@ -419,8 +423,22 @@ def build_symbolic_answer_prompt(
             selected_evidence,
             candidate_records,
             contract,
-            str(input_example.get("primary_evidence_type") or ""),
+            preferred_source_types,
+            str(input_example.get("question") or ""),
         )
+    targeted_ids = {
+        str(paper_id) for paper_id in selected_contexts.get("targeted_candidate_paper_ids") or []
+        if str(paper_id)
+    }
+    # A multi-paper query with two or more deterministically title-bound
+    # candidates should not make generation disambiguate unrelated homonyms.
+    # Keep the full candidate pool for selection and output validation; narrow
+    # only the prompt's paper-identity aid.
+    prompt_candidates = (
+        [candidate for candidate in candidate_records if str(candidate.get("paper_id") or "") in targeted_ids]
+        if multi_paper_task and len(targeted_ids) >= 2
+        else candidate_records
+    )
     payload = {
         "question": input_example.get("question"),
         "answer_contract": {key: value for key, value in contract.items() if key != "query_id"},
@@ -429,7 +447,7 @@ def build_symbolic_answer_prompt(
         # Candidate titles are not L2 evidence. In keyed mode the model sees
         # only immutable paper IDs; a table cell requiring a formal title is
         # resolved from its C-key's paper ID after factual grounding.
-        "candidate_papers": ([{"paper_id": c.get("paper_id")} for c in candidate_records] if keyed_mode else [_project_candidate_for_prompt(c) for c in candidate_records]),
+        "candidate_papers": ([{"paper_id": c.get("paper_id")} for c in prompt_candidates] if keyed_mode else [_project_candidate_for_prompt(c) for c in prompt_candidates]),
         "evidence_output_limit": evidence_output_limit,
         "table_plan_limit": table_plan_limit,
     }
@@ -473,11 +491,11 @@ def build_symbolic_answer_prompt(
         if multi_paper_task:
             target["contributing_papers"] = [{"paper_id": "<candidate paper id>"}]
         if "table" in required_answer_fields:
-            target["table_answer_plan"] = [{"row_support_key": "C001", "values": {"<table_schema column>": "<value>"}}]
+            target["table_answer_plan"] = [_table_plan_shape(table_schema, keyed=True)]
         keyed_instructions = [
             "Use only L2 cards/micro rows, verified triples or requested expansions, and matching image_ref crops. Cite triple or expansion facts through their support_card_keys.",
             "Match TARGET_JSON_SHAPE and answer_contract exactly. Every factual claim needs one to four visible Cxxx keys; never emit raw refs, locators, page numbers, labels, R/P/S keys, or invented keys.",
-            "Use only candidate paper IDs. For multi-paper answers list only supported contributors. For tables use row_support_key and exact schema columns; output the source C-card paper_id for Paper Title.",
+            "Use only candidate paper IDs. For multi-paper answers list only supported contributors. For tables use row_support_key and exact schema columns; when direct support exists, table_answer_plan must contain a non-empty row and answer.table.rows must mirror its values. Output the source C-card paper_id for Paper Title.",
             "For multiple choice output one listed key. Freeform is the shortest supported answer span; prefer sparse grounded output to unsupported claims.",
         ]
         user = (
@@ -487,18 +505,18 @@ def build_symbolic_answer_prompt(
         )
         return [{"role": "system", "content": "Return valid JSON only."}, {"role": "user", "content": user}]
     user = (
-        "Use only INPUT evidence. Cite direct support by echoing evidence_refs; the runtime restores locators. Do not invent IDs, pages, or evidence.\n"
+        "Use only INPUT evidence. Every evidence_refs and row_evidence_ref value must be one exact E#### token copied from INPUT, never a full ledger line; the runtime restores locators. Do not invent IDs, pages, or evidence.\n"
         + (
             "List every supported contributor in contributing_papers and gold_papers; keep evidence_refs top-level.\n"
             if multi_paper_task
             else ""
         )
         + "Match answer_contract and TARGET_JSON_SHAPE exactly; include only its answer types and use candidate paper IDs only. "
-        "For multiple choice choose exactly one listed option key. For freeform follow answer_style_guidance and give the shortest supported span. "
+        + "For multiple choice choose exactly one listed option key. For freeform follow answer_style_guidance and give the shortest supported span. "
         + (
-            f"For tables output at most {table_plan_limit} table_answer_plan rows with a direct Cxxx row_support_key and exact schema columns; the runtime restores row sources. "
+            f"For tables output at most {table_plan_limit} table_answer_plan rows with a direct Cxxx row_support_key and exact schema columns; emit one row per separately requested entity/value, never use 'not specified' as a value, and treat a setting-only row as applying to following method rows until the next setting row; the runtime restores row sources. "
             if evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only"
-            else f"For tables output at most {table_plan_limit} table_answer_plan rows with an input row_evidence_ref, row_source, and exact schema columns. Use table_structure for alignment. "
+            else f"For tables output at most {table_plan_limit} table_answer_plan rows with an exact E#### row_evidence_ref and exact schema columns. When direct support exists, emit a non-empty plan and mirror its values in answer.table.rows. Use table_structure for alignment: emit one row per separately requested entity/value, never use 'not specified' as a value, and treat a setting-only row as applying to following method rows until the next setting row. "
         )
         + f"{image_note} {partial_note}\n"
         f"INPUT:\n{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}\n\n"
@@ -511,7 +529,15 @@ def build_symbolic_answer_prompt(
             else ""
         )
         + (
-            ('  "table_answer_plan": [{"row_support_key": "C001", "values": {"<table_schema column>": "<value>"}}],\n' if evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only" else '  "table_answer_plan": [{"row_evidence_ref": "<an L2 support ref>", "row_source": {"paper_id": "<paper id>", "page": 1, "label": "Table 1"}, "values": {"<table_schema column>": "<value>"}}],\n')
+            '  "table_answer_plan": ['
+            + json.dumps(
+                _table_plan_shape(
+                    table_schema,
+                    keyed=bool(evidence_hierarchy and str(evidence_hierarchy.get("prompt_mode") or "") == "keyed_l2_only"),
+                ),
+                ensure_ascii=False,
+            )
+            + '],\n'
             if "table" in required_answer_fields
             else ""
         )

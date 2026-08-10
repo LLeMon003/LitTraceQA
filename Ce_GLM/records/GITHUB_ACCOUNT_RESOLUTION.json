@@ -1,0 +1,15 @@
+{
+  "status": "AUTHENTICATED",
+  "created_at_utc": "2026-07-18T17:35:10.235155+00:00",
+  "github_host": "github.com",
+  "authenticated_login": "constantine617",
+  "authenticated_id": 146884276,
+  "authentication_method": "GitHub CLI keyring token store",
+  "relevant_scopes": [
+    "repo",
+    "workflow",
+    "read:org",
+    "gist"
+  ],
+  "token_value_recorded": false
+}

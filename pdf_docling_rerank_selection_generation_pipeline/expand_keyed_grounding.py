@@ -16,11 +16,17 @@ from typing import Any
 from .data_io import find_official_file, read_jsonl, write_jsonl
 from .evidence_hierarchy import keyed_hierarchy_prompt_projection
 from .symbolic_schema import canonicalize_locator, to_official_source_type
+from .task_structure import derive_task_structure
 
 
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Expand grounded evidence by one frozen L2 card per query claim.")
     parser.add_argument("--official-dir", default="official_dev")
+    parser.add_argument(
+        "--inputs",
+        default="",
+        help="Input JSONL (e.g. official_dev/data/test.jsonl). Defaults to official validation_inputs.jsonl.",
+    )
     parser.add_argument("--predictions-input", required=True)
     parser.add_argument("--internal-predictions-input", required=True)
     parser.add_argument("--hierarchy-input", required=True)
@@ -68,6 +74,7 @@ def expand_prediction(
     hierarchy: dict[str, Any],
     *,
     task_family: str,
+    is_multi_paper: bool | None = None,
     max_cards: int,
     expand_papers: str,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -132,7 +139,7 @@ def expand_prediction(
             added_papers.append(paper_id)
     output["evidence"] = evidence
 
-    is_multi = "multi" in str(task_family or "").lower()
+    is_multi = is_multi_paper if is_multi_paper is not None else "multi" in str(task_family or "").lower()
     if expand_papers == "all" or (expand_papers == "multi" and is_multi):
         papers = [item for item in output.get("gold_papers") or [] if isinstance(item, dict) and item.get("paper_id")]
         known = {str(item.get("paper_id")) for item in papers}
@@ -155,7 +162,8 @@ def expand_prediction(
 
 def main() -> int:
     args = _args()
-    inputs = {str(row.get("query_id") or ""): row for row in read_jsonl(find_official_file(args.official_dir, "validation_inputs.jsonl"))}
+    inputs_path = Path(args.inputs) if args.inputs else find_official_file(args.official_dir, "validation_inputs.jsonl")
+    inputs = {str(row.get("query_id") or ""): row for row in read_jsonl(inputs_path)}
     predictions = {str(row.get("query_id") or ""): row for row in read_jsonl(args.predictions_input)}
     internal = {str(row.get("query_id") or ""): row for row in read_jsonl(args.internal_predictions_input)}
     hierarchies = {
@@ -173,13 +181,14 @@ def main() -> int:
             output_rows.append(prediction)
             audit.append({"query_id": query_id, "status": "unchanged_missing_internal_or_hierarchy"})
             continue
-        is_multi = "multi" in str(sample.get("task_family") or "").lower()
+        structure = derive_task_structure(sample)
         expanded, row_audit = expand_prediction(
             prediction,
             current,
             hierarchy,
             task_family=str(sample.get("task_family") or ""),
-            max_cards=args.max_cards_multi if is_multi else args.max_cards_single,
+            is_multi_paper=structure.is_multi_paper,
+            max_cards=args.max_cards_multi if structure.is_multi_paper else args.max_cards_single,
             expand_papers=args.expand_papers,
         )
         output_rows.append(expanded)

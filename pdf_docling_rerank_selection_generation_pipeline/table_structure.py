@@ -1,11 +1,100 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Iterable
 
 
 _NUMERIC_RE = re.compile(r"[-+]?(?:\d+(?:,\d{3})*|\d*\.\d+)(?:[%xX])?")
 _MARKDOWN_SEPARATOR_RE = re.compile(r"^\s*:?-{2,}:?\s*$")
+_UNIT_SUFFIX_RE = re.compile(
+    r"^(.*?)\s*(?:%|x|s|ms|h|min|sec|secs|seconds|gb|mb|kb|tb|gib|mib|kib|g|m|k|b|tokens?|it|iters?|iterations?|epochs?|steps?)\s*$",
+    re.IGNORECASE,
+)
+
+
+def normalize_schema_key(value: Any) -> str:
+    """Compact lowercase alphanumeric form of a schema column name."""
+    return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
+
+
+def schema_tokens(value: Any) -> set[str]:
+    """Meaningful lowercase tokens of a column name (drops single letters)."""
+    return {token for token in re.findall(r"[a-z0-9]+", str(value or "").lower()) if len(token) >= 2}
+
+
+def match_schema_column(model_key: Any, schema_columns: Iterable[str]) -> str | None:
+    """Best-matching official schema column for a model-provided key.
+
+    Exact compact match wins; otherwise the schema column with the largest
+    token overlap is chosen (e.g. schema ``ndcg_at_10`` vs model ``NDCG@10``).
+    Ties are rejected so a generic key is never mis-assigned.
+    """
+    columns = [str(column) for column in schema_columns if str(column)]
+    if not columns:
+        return None
+    target = normalize_schema_key(model_key)
+    exact = [column for column in columns if normalize_schema_key(column) == target]
+    if len(exact) == 1:
+        return exact[0]
+    target_tokens = schema_tokens(model_key)
+    if not target_tokens:
+        return None
+    scored = sorted(
+        ((len(target_tokens & schema_tokens(column)), column) for column in columns),
+        reverse=True,
+    )
+    if not scored or scored[0][0] < 1:
+        return None
+    best_score = scored[0][0]
+    tied = [column for score, column in scored if score == best_score]
+    return tied[0] if len(tied) == 1 else None
+
+
+def remap_row_values(values: dict[str, Any], schema_columns: Iterable[str]) -> dict[str, Any]:
+    """Rebuild a model-provided table row under the official schema columns.
+
+    Keys that match an official column (exactly or by token overlap) keep their
+    value under the official name; unknown keys are dropped; official columns
+    with no value are kept as ``None`` so callers can decide row completeness.
+    """
+    columns = [str(column) for column in schema_columns if str(column)]
+    by_exact = {normalize_schema_key(column): column for column in columns}
+    remapped: dict[str, Any] = {}
+    consumed: set[str] = set()
+    unmatched: list[tuple[str, Any]] = []
+    for raw_key, value in (values or {}).items():
+        column = by_exact.get(normalize_schema_key(raw_key))
+        if column is not None and column not in consumed:
+            remapped[column] = value
+            consumed.add(column)
+        else:
+            unmatched.append((str(raw_key), value))
+    for raw_key, value in unmatched:
+        match = match_schema_column(raw_key, [column for column in columns if column not in consumed])
+        if match is not None:
+            remapped[match] = value
+            consumed.add(match)
+    return {column: remapped.get(column) for column in columns}
+
+
+def coerce_number_cell(value: Any) -> Any:
+    """Coerce a numeric cell to int/float, stripping a trailing unit suffix."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value
+    text = str(value or "").strip()
+    if not text:
+        return value
+    match = _UNIT_SUFFIX_RE.match(text)
+    candidate = match.group(1) if match else text
+    candidate = candidate.replace(",", "").strip()
+    try:
+        if re.fullmatch(r"[-+]?\d+", candidate):
+            return int(candidate)
+        return float(candidate)
+    except ValueError:
+        return value
 
 
 def _clean_cell(value: Any) -> str:

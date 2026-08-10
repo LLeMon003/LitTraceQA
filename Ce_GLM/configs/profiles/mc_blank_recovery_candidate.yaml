@@ -1,0 +1,16 @@
+profile: V23_MC_BLANK_RECOVERY_001
+classification: candidate
+baseline_tag: v2.3
+baseline_commit: 409cdd5a53e2ed9cf3c2c8bdb6e79f1e5dd4d9fe
+implementation_commit: ac444043827ef5938abeabab0dfe2f793e48d69e
+model: deepseek-ai/DeepSeek-V3.2
+temperature: 0
+input_policy: fill only blank multiple-choice fields
+context_policy: frozen selected-paper objects; evidence pages prioritized
+option_policy: ordered options; exactly one supplied option letter required
+replay_policy: offline freeze from hash-locked source prediction and decisions
+artifact_manifest: records/experiments/V23_MC_BLANK_RECOVERY_001/ARTIFACT_REQUIREMENTS.json
+expected_prediction_sha256: 98C9AF8031E0CA4CEF59E21554A53660740C2C28703DE5E49D725A0E5A0A6597
+expected_mc_accuracy: 33/41
+gold_required_for_replay: false
+api_required_for_replay: false

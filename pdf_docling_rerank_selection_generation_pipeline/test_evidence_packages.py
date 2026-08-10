@@ -1,6 +1,7 @@
 import unittest
 
 from pdf_docling_rerank_selection_generation_pipeline.evidence_packages import EvidencePackageConfig, build_packages, select_packages
+from pdf_docling_rerank_selection_generation_pipeline.reselect_cached_qwen import _compact
 
 
 def _record(identifier, paper, source_type, text, page=1, label="", order=1):
@@ -18,6 +19,10 @@ def _record(identifier, paper, source_type, text, page=1, label="", order=1):
 
 
 class EvidencePackageTests(unittest.TestCase):
+    def test_frozen_selection_keeps_docling_table_structure(self):
+        structure = {"format": "docling_table_cells_v1", "rows": [{"row_label": "A"}]}
+        self.assertEqual(_compact({"paper_id": "p", "table_structure": structure})["table_structure"], structure)
+
     def test_object_package_keeps_neighboring_text_and_canonical_record(self):
         records = [
             _record("p::t1", "p", "text_span", "before table", order=1),
@@ -188,7 +193,7 @@ class EvidencePackageTests(unittest.TestCase):
         }
         result = select_packages(
             query="Which Figure 2 shows the method?",
-            packages=build_packages(records, trace, EvidencePackageConfig(package_budget=1)),
+            packages=build_packages(records, trace, EvidencePackageConfig(package_budget=2)),
             primary_evidence_type="figure",
             is_multi_paper_task=False,
             route_queries=[],
@@ -237,6 +242,135 @@ class EvidencePackageTests(unittest.TestCase):
         )
         self.assertEqual({package["anchor_record_id"] for package in result["packages"]}, {"p::direct", "p::aux"})
         self.assertEqual(result["trace"]["hyde_claim_route_count"], 1)
+
+    def test_slot_route_enforces_its_record_type(self):
+        records = [
+            _record("p::text", "p", "text_span", "Method A F1", order=1),
+            _record("p::table", "p", "table", "Method A F1", label="Table 1", order=2),
+        ]
+        trace = {"ranked_units": [
+            {"record_ids": ["p::text"], "score_contract": {"local_relevance": 0.9}},
+            {"record_ids": ["p::table"], "score_contract": {"local_relevance": 0.1}},
+        ]}
+        result = select_packages(
+            query="Method A F1",
+            packages=build_packages(records, trace, EvidencePackageConfig(package_budget=2)),
+            primary_evidence_type="text_span",
+            is_multi_paper_task=False,
+            route_queries=[],
+            slot_route_queries=[("table Method A F1", ("table",))],
+            config=EvidencePackageConfig(package_budget=2),
+        )
+        self.assertIn("p::table", {package["anchor_record_id"] for package in result["packages"]})
+        self.assertEqual(result["trace"]["slot_route_count"], 1)
+
+    def test_slot_paper_table_route_prefers_joint_dataset_ipc_column(self):
+        records = [
+            _record("p::main", "p", "table", "NCFM Tiny ImageNet main result", label="Table 1", order=1),
+            _record("p::ablation", "p", "table", "NCFM Tiny ImageNet 10 10 10 ablation", label="Table 5", order=2),
+        ]
+        records[0]["table_structure"] = {"columns": ["Tiny ImageNet / 1", "Tiny ImageNet / 10", "Tiny ImageNet / 50"]}
+        records[1]["table_structure"] = {"columns": ["Tiny ImageNet / 1", "Tiny ImageNet / 50", "CIFAR-10 / 10"]}
+        trace = {"ranked_units": [
+            {"record_ids": ["p::main"], "score_contract": {"local_relevance": 0.1}},
+            {"record_ids": ["p::ablation"], "score_contract": {"local_relevance": 0.9}},
+        ]}
+        result = select_packages(
+            query="NCFM Tiny ImageNet IPC=10",
+            packages=build_packages(records, trace, EvidencePackageConfig(package_budget=1)),
+            primary_evidence_type="table",
+            is_multi_paper_task=False,
+            route_queries=[],
+            slot_paper_route_queries=[("p", "table NCFM IPC=10 Dataset: Tiny ImageNet", ("table",))],
+            config=EvidencePackageConfig(package_budget=1),
+        )
+        self.assertEqual(result["packages"][0]["anchor_record_id"], "p::main")
+
+    def test_slot_paper_table_route_prefers_dataset_column_over_caption_mention(self):
+        records = [
+            _record("p::main", "p", "table", "Table 1. Classification accuracy on ModelNet40.", label="Table 1", order=1),
+            _record("p::fewshot", "p", "table", "Table 4. Few-shot learning on ModelNet40 accuracy.", label="Table 4", order=2),
+        ]
+        records[0]["table_structure"] = {"columns": ["Method", "ModelNet40 / OA (%)"], "rows": []}
+        records[1]["table_structure"] = {"columns": ["Method", "5-way / 10-shot"], "rows": []}
+        result = select_packages(
+            query="PMA ModelNet40 classification accuracy",
+            packages=build_packages(records, {"ranked_units": []}, EvidencePackageConfig(package_budget=1)),
+            primary_evidence_type="table",
+            is_multi_paper_task=False,
+            route_queries=[],
+            slot_paper_route_queries=[("p", "table PMA ModelNet40 classification accuracy", ("table",))],
+            config=EvidencePackageConfig(package_budget=1),
+        )
+        self.assertEqual(result["packages"][0]["anchor_record_id"], "p::main")
+
+    def test_table_output_shape_does_not_drop_each_slot_type_package(self):
+        records = [
+            _record("p::text", "p", "text_span", "method description", page=1),
+            _record("p::equation", "p", "equation_algorithm", "L = loss + regularizer", page=2, label="Equation 4"),
+            _record("p::citation", "p", "citation_context", "We extend the cited baseline.", page=3, label="Reference 7"),
+        ]
+        trace = {"ranked_units": [
+            {"record_ids": ["p::text"], "score_contract": {"local_relevance": 0.9}},
+            {"record_ids": ["p::equation"], "score_contract": {"local_relevance": 0.2}},
+            {"record_ids": ["p::citation"], "score_contract": {"local_relevance": 0.1}},
+        ]}
+        config = EvidencePackageConfig(package_budget=3)
+        result = select_packages(
+            query="Fill the final JSON rows.",
+            packages=build_packages(records, trace, config),
+            preferred_source_types=(),
+            is_multi_paper_task=False,
+            route_queries=[],
+            slot_route_queries=[
+                ("method description", ("text_span",)),
+                ("loss regularizer", ("equation_algorithm",)),
+                ("cited baseline", ("citation_context",)),
+            ],
+            config=config,
+        )
+        self.assertEqual(
+            {package["source_type"] for package in result["packages"]},
+            {"text_span", "equation_algorithm", "citation_context"},
+        )
+        self.assertEqual(result["trace"]["slot_route_selected_count"], 3)
+
+    def test_catalog_fallback_route_reserves_its_best_type_valid_package(self):
+        records = [
+            _record("p::generic", "p", "table", "Method A result", label="Table 1", order=1),
+            _record("p::budget", "p", "table", "ECM-XL 102.4M training budget result", page=2, label="Table 2", order=2),
+        ]
+        result = select_packages(
+            query="Method A result",
+            packages=build_packages(records, {"ranked_units": []}, EvidencePackageConfig(package_budget=2)),
+            is_multi_paper_task=False,
+            route_queries=[],
+            slot_route_queries=[("Method A", ("table",))],
+            catalog_fallback_slot_route_queries=[("ECM-XL 102.4M training budget", ("table",))],
+            config=EvidencePackageConfig(package_budget=2),
+        )
+        self.assertEqual(
+            {package["anchor_record_id"] for package in result["packages"]},
+            {"p::generic", "p::budget"},
+        )
+        self.assertEqual(result["trace"]["catalog_fallback_slot_route_selected_count"], 1)
+
+    def test_slot_paper_route_enforces_paper_and_record_type(self):
+        records = [
+            _record("other::equation", "other", "equation_algorithm", "RomanTex rotation matrix", order=1),
+            _record("roman::text", "roman", "text_span", "RomanTex rotation matrix", order=2),
+            _record("roman::equation", "roman", "equation_algorithm", "RomanTex rotation matrix", order=3),
+        ]
+        result = select_packages(
+            query="How does RomanTex use a rotation matrix?",
+            packages=build_packages(records, {"ranked_units": []}, EvidencePackageConfig(package_budget=2)),
+            is_multi_paper_task=True,
+            route_queries=[],
+            slot_paper_route_queries=[("roman", "equation_algorithm RomanTex rotation matrix", ("equation_algorithm",))],
+            config=EvidencePackageConfig(package_budget=2),
+        )
+        self.assertIn("roman::equation", {package["anchor_record_id"] for package in result["packages"]})
+        self.assertEqual(result["trace"]["slot_paper_route_selected_count"], 1)
 
     def test_paper_local_route_reserves_local_bm25_anchor(self):
         records = [

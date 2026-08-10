@@ -1,0 +1,20 @@
+{
+  "status": "PASS",
+  "manifest": "records\\PROVISIONAL_COMBINED_MC40_MANIFEST.json",
+  "records_checked": 71,
+  "hashes": {
+    "parent": "B85159FA80AF6F2C6EA7F096B0ABAE695B99B14969AD271327B78000140E9FAE",
+    "output": "844C6248E8A353783BE7600050BBB247A7716931B24C3C2C10FD173B04CE6914",
+    "component_mc": "40546BE8C4D2FBE5C7F18F23D27AB08BC524C33EF0601249D710EFEF8AAE20EE",
+    "component_paper": "0440F91D97E55EA99163590C506050720DDBC6CFA0C31A4604D4A4BF9DB5DD26",
+    "component_evidence": "A76B43EC22C2683D46055CBC49424EDC200D226C286B7094ACB8FA2BDA534589",
+    "component_table": "364C5DB2B3A1D126AE9F5FA1A7D583846806B768DB89A7E55C0CB0FCF2E192EF"
+  },
+  "checks": [
+    "71 unique IDs in frozen B order",
+    "all component and output hashes match manifest",
+    "only designated component fields copied",
+    "all non-component fields preserve B",
+    "Evidence is contained in the selected Paper set"
+  ]
+}

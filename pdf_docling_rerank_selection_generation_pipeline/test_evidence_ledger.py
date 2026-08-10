@@ -44,3 +44,4 @@ def test_multi_paper_ledger_protocol_has_bounded_nonduplicated_evidence() -> Non
     assert "contributing_papers" in prompt
     assert '"query_id"' not in prompt
     assert '"evidence_refs"' in prompt
+

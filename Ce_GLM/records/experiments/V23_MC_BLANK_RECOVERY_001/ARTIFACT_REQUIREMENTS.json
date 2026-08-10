@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "experiment_id": "V23_MC_BLANK_RECOVERY_001",
+  "artifact_root_environment_variable": "LITTRACEQA_V23_ARTIFACT_ROOT",
+  "source_prediction_environment_variable": "LITTRACEQA_V23_SOURCE_PREDICTION",
+  "replay_required": [
+    {
+      "role": "version_2_3_source_prediction",
+      "filename": "predictions_reassembled.jsonl",
+      "sha256": "A3B9140444573CF1DA529091C653B9B7EC9CDAC61D453FA2724BCB1134442281",
+      "bytes": 27718
+    },
+    {
+      "role": "mc_source_lock",
+      "filename": "MC_SOURCE_LOCK.json",
+      "sha256": "C341F525FEA5B192CDD84C7C7B481E2DF53A2979662C526E9A8670676A8DA3EF",
+      "bytes": 1476
+    },
+    {
+      "role": "mc_recovery_decisions",
+      "filename": "mc_recovery_decisions.jsonl",
+      "sha256": "DA0175EAAB1FA4236E7A0AED5D7C0173CE5916A3C510327F76C424D9BCB1C37C",
+      "bytes": 20549
+    }
+  ],
+  "verification_only": [
+    {
+      "role": "frozen_candidate_prediction",
+      "filename": "mc_candidate_predictions.jsonl",
+      "sha256": "98C9AF8031E0CA4CEF59E21554A53660740C2C28703DE5E49D725A0E5A0A6597",
+      "bytes": 27729
+    },
+    {
+      "role": "candidate_freeze",
+      "filename": "MC_CANDIDATE_FREEZE.json",
+      "sha256": "5E3CE57DA7528FB2F05503FA86DBA52DC62E825D75061F6A4CA10219F05B2075",
+      "bytes": 514
+    },
+    {
+      "role": "authoritative_evaluation_result",
+      "filename": "mc_official_evaluation.json",
+      "sha256": "480DB129FBA3C8D2CAF4E51A514E93E644D9626FD0E9CEE2B0D3F0B6AD3DED51",
+      "bytes": 2701,
+      "must_not_be_invoked_during_replay": true
+    }
+  ],
+  "forbidden_for_replay": [
+    "official_gold",
+    "official_evaluator",
+    "api_credentials",
+    "api_calls",
+    "raw_api_responses"
+  ]
+}

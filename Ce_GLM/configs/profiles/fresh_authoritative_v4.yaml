@@ -1,0 +1,17 @@
+profile: FRESH_AUTHORITATIVE_V4
+classification: recommended_fresh_profile
+purpose: Reproduce the strongest currently verified blank-runtime-cache fresh profile.
+selection_basis: global authoritative fresh-score comparison only; never query-level gold or evaluator data
+mode: raw-fresh
+model: deepseek-ai/DeepSeek-V4-Flash
+endpoint: https://api.siliconflow.cn/v1
+temperature: 0
+retrieval: Version 2 retrieval plus PDF/object context
+context_policy: monolithic C0 historical fresh
+mc_option_policy: accepted Version 2 downstream option-aware base and typed MC
+table_policy: accepted Version 2 table processing plus schema reassembly
+freeform_policy: accepted Version 2 freeform chain
+evidence_policy: accepted Version 2 evidence processing
+fresh_boundary: absent runtime root; no resume; no sealed cache, historical prediction, raw response, gold, or evaluator input
+evaluation_policy: freeze then hash-verified replay before one separately locked evaluator invocation
+score_guarantee: none; provider generation remains externally stochastic despite temperature 0

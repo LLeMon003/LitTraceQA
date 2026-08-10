@@ -10,7 +10,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 
-from .parser import _label_to_locator, _resolve_evidence_ref_echo, normalize_prediction
+from .parser import _label_to_locator, _resolve_evidence_ref_echo, normalize_prediction, postprocess_table_rows, standardize_symbolic_evidence
 from .evidence_hierarchy import keyed_hierarchy_prompt_projection
 from .symbolic_schema import grounding_label_from_record
 from .generate_from_cached_selection import _posthoc_ground_keyed_prediction
@@ -21,6 +21,298 @@ from .vlm_answer_prompt_builder import build_symbolic_answer_prompt
 
 
 class PromptGroundingTests(unittest.TestCase):
+    def test_table_target_uses_actual_schema_columns(self):
+        sample = {
+            "query_id": "q", "question": "Report the score.", "answer_types": ["table"],
+            "table_schema": [{"name": "method", "type": "string", "is_row_key": True}, {"name": "score_value", "type": "number", "is_row_key": False}],
+        }
+        messages = build_symbolic_answer_prompt(sample, [], {"selected_evidence": []})
+        text = messages[-1]["content"]
+        self.assertIn('"method": "<value>"', text)
+        self.assertIn('"score_value": "<value>"', text)
+        self.assertNotIn("<table_schema column>", text)
+        self.assertNotIn('"row_source"', text)
+        self.assertIn("one exact E#### token", text)
+        self.assertIn("setting-only row", text)
+        self.assertIn("never use 'not specified'", text)
+
+    def test_table_output_keeps_non_table_slot_packages(self):
+        sample = {
+            "query_id": "q", "question": "Report the equation result.", "answer_types": ["table"],
+            "table_schema": [{"name": "metric", "type": "string", "is_row_key": True}],
+        }
+        messages = build_symbolic_answer_prompt(sample, [{"paper_id": "paper", "title": "Paper"}], {
+            "compact_chunk_packets": [{
+                "paper_id": "paper", "section_id": "method", "section_title": "Method",
+                "section_type": "method", "section_path": ["Method"], "chunk_ref": "pkg::equation",
+                "package_id": "pkg::equation", "anchor_record_id": "paper::equation",
+                "package_source_type": "equation_algorithm", "package_label": "Equation 3",
+                "record_defaults": {"page": 2}, "records": [{
+                    "evidence_ref": "E0001", "source_type": "equation_algorithm", "label": "Equation 3",
+                    "locator": {"page": 2, "equation_id": "3"}, "text": "loss = 0.1",
+                }],
+            }],
+        })
+        self.assertIn('"package_source_type":"equation_algorithm"', messages[-1]["content"])
+
+    def test_table_output_can_use_text_equation_and_citation_evidence(self):
+        sample = {
+            "query_id": "q", "question": "Fill the final JSON rows.", "answer_types": ["table"],
+            "table_schema": [{"name": "result", "type": "string", "is_row_key": True}],
+        }
+        evidence = [
+            {"paper_id": "paper", "page": 1, "source_type": "text_span", "text": "Method description."},
+            {"paper_id": "paper", "page": 2, "source_type": "equation_algorithm", "label": "Equation 4", "text": "L = loss."},
+            {"paper_id": "paper", "page": 3, "source_type": "citation_context", "label": "Reference 7", "text": "We extend baseline 7."},
+        ]
+        messages = build_symbolic_answer_prompt(sample, [{"paper_id": "paper", "title": "Paper"}], {"selected_evidence": evidence})
+        text = messages[-1]["content"]
+        self.assertIn('"primary_source_type":"text_span"', text)
+        self.assertIn('"primary_source_type":"equation_algorithm"', text)
+        self.assertIn('"primary_source_type":"citation_context"', text)
+
+    def test_table_prompt_includes_query_aligned_table_view(self):
+        sample = {
+            "query_id": "q", "question": "What is Method B's FID?", "answer_types": ["table"],
+            "table_schema": [{"name": "Method", "type": "string"}, {"name": "FID", "type": "number"}],
+        }
+        evidence = [{
+            "paper_id": "paper", "page": 2, "source_type": "table", "label": "Table 1",
+            "text": "Table 1\n| Method | FID |\n| --- | --- |\n| Method A | 3.1 |\n| Method B | 2.0 |",
+        }]
+        text = build_symbolic_answer_prompt(sample, [{"paper_id": "paper", "title": "Paper"}], {"selected_evidence": evidence})[-1]["content"]
+        self.assertIn('"table_view"', text)
+        self.assertIn('"row_label":"Method B"', text)
+
+    def test_multi_paper_prompt_hides_unrouted_homonym_candidates(self):
+        sample = {"query_id": "q", "question": "Compare the two target methods.", "answer_types": ["table"]}
+        messages = build_symbolic_answer_prompt(sample, [
+            {"paper_id": "target_a", "title": "DISCO target A"},
+            {"paper_id": "target_b", "title": "DISCO target B"},
+            {"paper_id": "homonym", "title": "Unrelated DISCO"},
+        ], {"selected_evidence": [], "targeted_candidate_paper_ids": ["target_a", "target_b"]}, multi_paper_task=True)
+        text = messages[-1]["content"]
+        self.assertIn('"paper_id":"target_a"', text)
+        self.assertIn('"paper_id":"target_b"', text)
+        self.assertNotIn('"paper_id":"homonym"', text)
+
+    def test_table_plan_row_ref_restores_evidence_without_top_level_echo(self):
+        sample = {
+            "query_id": "q", "question": "Report the score.", "answer_types": ["table"],
+            "table_schema": [{"name": "method", "type": "string", "is_row_key": True}, {"name": "score", "type": "number", "is_row_key": False}],
+        }
+        selected = [{
+            "evidence_ref": "E0001", "paper_id": "paper", "page": 2, "source_type": "table",
+            "label": "Table 1", "locator": {"page": 2, "table_id": "Table 1"}, "text": "Method A 71.16",
+        }]
+        prediction, _ = normalize_prediction(
+            {"gold_papers": [{"paper_id": "paper"}], "answer": {"table": {"rows": []}}, "table_answer_plan": [
+                {"row_evidence_ref": "E0001", "values": {"method": "Method A", "score": "71.16"}},
+            ]},
+            sample,
+            ["paper"],
+            selected_evidence=selected,
+        )
+        self.assertEqual(prediction["answer"]["table"]["rows"], [{"method": "Method A", "score": 71.16}])
+        self.assertEqual(prediction["evidence"], [{"paper_id": "paper", "source_type": "table", "locator": {"page": 2, "table_id": "Table 1"}}])
+
+    def test_table_numeric_value_prefers_the_row_evidence_table(self):
+        sample = {
+            "query_id": "q", "question": "Report Method A's score.", "answer_types": ["table"],
+            "table_schema": [{"name": "method", "type": "string", "is_row_key": True}, {"name": "score", "type": "number"}],
+        }
+        selected = [
+            {"evidence_ref": "E0001", "paper_id": "paper", "source_type": "table", "table_structure": {
+                "columns": ["Method", "Score"], "rows": [{"row_label": "Method A", "values": {"Method": "Method A", "Score": "1.0"}}],
+            }},
+            {"evidence_ref": "E0002", "paper_id": "paper", "source_type": "table", "table_structure": {
+                "columns": ["Method", "Score"], "rows": [{"row_label": "Method A", "values": {"Method": "Method A", "Score": "2.0"}}],
+            }},
+        ]
+        prediction, errors = normalize_prediction(
+            {"answer": {"table": {"rows": []}}, "table_answer_plan": [
+                {"row_evidence_ref": "E0001", "values": {"method": "Method A", "score": "9.0"}},
+            ]}, sample, ["paper"], selected_evidence=selected,
+        )
+        self.assertEqual(prediction["answer"]["table"]["rows"], [{"method": "Method A", "score": 1.0}])
+        self.assertTrue(any(error["type"] == "table_numeric_value_recovered_from_row_evidence" for error in errors))
+
+    def test_table_postprocess_preserves_distinct_composite_row_keys(self):
+        rows, errors = postprocess_table_rows(
+            [{"method": "A", "setting": "x", "value": "1"}, {"method": "A", "setting": "y", "value": "2"}],
+            ["method", "setting", "value"],
+            {"table_schema": [
+                {"name": "method", "is_row_key": True},
+                {"name": "setting", "is_row_key": True},
+                {"name": "value", "type": "number", "is_row_key": False},
+            ]},
+        )
+        self.assertEqual(len(rows), 2)
+        self.assertNotIn("table_duplicate_row_removed", errors)
+
+    def test_table_postprocess_canonicalizes_verbose_method_to_question_alias(self):
+        rows, errors = postprocess_table_rows(
+            [{"Method": "TCM (ours)", "FID": "2.05"}],
+            ["Method", "FID"],
+            {
+                "question": "What is the FID of TCM?",
+                "table_schema": [
+                    {"name": "Method", "is_row_key": True},
+                    {"name": "FID", "type": "number", "is_row_key": False},
+                ],
+            },
+        )
+        self.assertEqual(rows, [{"Method": "TCM", "FID": 2.05}])
+        self.assertIn("table_question_alias_row_key_canonicalized", errors)
+
+    def test_table_postprocess_does_not_collapse_internal_paper_ids_into_venue_alias(self):
+        rows, errors = postprocess_table_rows(
+            [
+                {"paper": "iccv2025_00046", "detail": "FocalPETR-r18 speedup", "value": "1.18x"},
+                {"paper": "iccv2025_00046", "detail": "StreamPETR-vov speedup", "value": "1.19x"},
+            ],
+            ["paper", "detail", "value"],
+            {"question": "For ICCV 2025 FocalPETR and StreamPETR, report speedups.", "table_schema": [
+                {"name": "paper", "is_row_key": True}, {"name": "detail"}, {"name": "value"},
+            ]},
+        )
+        self.assertEqual([row["paper"] for row in rows], ["FocalPETR", "StreamPETR"])
+        self.assertIn("table_internal_paper_id_replaced_by_detail_label", errors)
+
+    def test_table_postprocess_keeps_only_explicit_fake_condition_rows(self):
+        rows, errors = postprocess_table_rows(
+            [
+                {"dataset": "SciFact", "score": "77.0"},
+                {"dataset": "SciFact+Fake1", "score": "68.0"},
+                {"dataset": "SciFact+Fake2", "score": "67.3"},
+            ],
+            ["dataset", "score"],
+            {"question": "What score is achieved on the Fake2-contaminated version of SciFact?", "table_schema": [
+                {"name": "dataset", "is_row_key": True}, {"name": "score", "type": "number"},
+            ]},
+        )
+        self.assertEqual(rows, [{"dataset": "SciFact+Fake2", "score": 67.3}])
+        self.assertIn("table_rows_filtered_to_explicit_fake_condition", errors)
+
+    def test_table_postprocess_does_not_expand_short_method_alias(self):
+        rows, _ = postprocess_table_rows(
+            [
+                {"Method": "ECM", "FID": "3.60"},
+                {"Method": "ECM-XL (100k iters)", "FID": "2.49"},
+                {"Method": "ECM-XL ⋆", "FID": "1.67"},
+            ],
+            ["Method", "FID"],
+            {"question": "What is ECM-XL (with 102.4M training budget)?", "table_schema": [
+                {"name": "Method", "is_row_key": True}, {"name": "FID", "type": "number"},
+            ]},
+        )
+        self.assertEqual(rows, [
+            {"Method": "ECM", "FID": 3.6},
+            {"Method": "ECM-XL (102.4M)", "FID": 2.49},
+        ])
+
+    def test_table_postprocess_keeps_question_matched_condition_suffix(self):
+        rows, errors = postprocess_table_rows(
+            [{"Method": "DetAny3D (ours) w/ Ground Truth", "AP": "36.7"}],
+            ["Method", "AP"],
+            {"question": "What is DetAny3D performance with ground-truth prompts?", "table_schema": [
+                {"name": "Method", "is_row_key": True}, {"name": "AP", "type": "string"},
+            ]},
+        )
+        self.assertEqual(rows, [{"Method": "w/ Ground Truth", "AP": "36.7"}])
+        self.assertIn("table_question_condition_suffix_canonicalized", errors)
+
+    def test_table_postprocess_restores_explicit_training_budget_row_key(self):
+        rows, errors = postprocess_table_rows(
+            [{"Method": "ECM-XL", "FID": "2.49"}], ["Method", "FID"],
+            {"question": "What is ECM-XL (with 102.4M training budget)?", "table_schema": [
+                {"name": "Method", "is_row_key": True}, {"name": "FID", "type": "number"},
+            ]},
+        )
+        self.assertEqual(rows, [{"Method": "ECM-XL (102.4M)", "FID": 2.49}])
+        self.assertIn("table_question_budget_row_key_canonicalized", errors)
+        rows, _ = postprocess_table_rows(rows, ["Method", "FID"], {
+            "question": "What is ECM-XL (with 102.4M training budget)?", "table_schema": [
+                {"name": "Method", "is_row_key": True}, {"name": "FID", "type": "number"},
+            ],
+        })
+        self.assertEqual(rows, [{"Method": "ECM-XL (102.4M)", "FID": 2.49}])
+
+    def test_table_postprocess_compacts_explicit_budget_without_question(self):
+        rows, errors = postprocess_table_rows(
+            [{"Method": "ECM-XL (with 102.4M training budget)", "FID": "2.49"}], ["Method", "FID"],
+            {"table_schema": [{"name": "Method", "is_row_key": True}, {"name": "FID", "type": "number"}]},
+        )
+        self.assertEqual(rows, [{"Method": "ECM-XL (102.4M)", "FID": 2.49}])
+        self.assertIn("table_explicit_budget_row_key_compacted", errors)
+
+    def test_table_postprocess_canonicalizes_alias_when_only_spacing_differs(self):
+        rows, errors = postprocess_table_rows(
+            [{"Methods": "DED A", "Score": "44.5"}], ["Methods", "Score"],
+            {"question": "Report DEDA.", "table_schema": [{"name": "Methods", "is_row_key": True}]},
+        )
+        self.assertEqual(rows[0]["Methods"], "DEDA")
+        self.assertIn("table_question_alias_row_key_canonicalized", errors)
+
+    def test_table_postprocess_recovers_unique_selected_structure_cell(self):
+        rows, errors = postprocess_table_rows(
+            [{"Methods": "DEDA", "Accuracy": "59.3 ± 0.3"}], ["Methods", "Accuracy"],
+            {"question": "What is the test accuracy on Tiny ImageNet given IPC=10?", "table_schema": [
+                {"name": "Methods", "is_row_key": True}, {"name": "Accuracy", "type": "string"},
+            ]},
+            [{"source_type": "table", "table_structure": {
+                "columns": ["Tiny-ImageNet / IPC = 10", "Tiny-ImageNet / IPC = 100"],
+                "rows": [{"row_label": "DEDA", "values": {
+                    "Tiny-ImageNet / IPC = 10": "44.5 ± 0.6", "Tiny-ImageNet / IPC = 100": "59.3 ± 0.3",
+                }}],
+            }}],
+        )
+        self.assertEqual(rows, [{"Methods": "DEDA", "Accuracy": "44.5±0.6"}])
+        self.assertIn("table_value_recovered_from_selected_structure", errors)
+
+    def test_table_postprocess_recovers_schema_matched_condition_column(self):
+        rows, errors = postprocess_table_rows(
+            [{"Method": "w/ Ground Truth", "AP nus 3D": "37.55"}], ["Method", "AP nus 3D"],
+            {"question": "What is the AP performance on Omni3D with ground-truth prompts?", "table_schema": [
+                {"name": "Method", "is_row_key": True}, {"name": "AP nus 3D", "type": "string"},
+            ]},
+            [{"source_type": "table", "table_structure": {
+                "columns": ["Omni3D OUT / AP nus 3D", "AP nus 3D"],
+                "rows": [{"row_label": "DetAny3D (ours) w/ Ground Truth", "values": {
+                    "Omni3D OUT / AP nus 3D": "36.7", "AP nus 3D": "37.55",
+                }}],
+            }}],
+        )
+        self.assertEqual(rows, [{"Method": "w/ Ground Truth", "AP nus 3D": "36.7"}])
+        self.assertIn("table_value_recovered_from_selected_structure", errors)
+
+    def test_table_postprocess_recovers_explicit_missing_condition_row(self):
+        rows, errors = postprocess_table_rows(
+            [{"Method": "w/ Ground Truth", "AP nus 3D": "36.7"}], ["Method", "AP nus 3D"],
+            {"question": "What is DetAny3D performance with ground-truth prompts and Cube R-CNN detections?", "table_schema": [
+                {"name": "Method", "is_row_key": True}, {"name": "AP nus 3D", "type": "string"},
+            ]},
+            [{"source_type": "table", "table_structure": {
+                "columns": ["Omni3D OUT / AP nus 3D"],
+                "rows": [
+                    {"row_label": "DetAny3D (ours) w/ Ground Truth", "values": {"Omni3D OUT / AP nus 3D": "36.7"}},
+                    {"row_label": "DetAny3D (ours) w/ Cube RCNN", "values": {"Omni3D OUT / AP nus 3D": "33.9"}},
+                ],
+            }}],
+        )
+        self.assertEqual(rows, [
+            {"Method": "w/ Ground Truth", "AP nus 3D": "36.7"},
+            {"Method": "w/ Cube RCNN", "AP nus 3D": "33.9"},
+        ])
+        self.assertIn("table_rows_recovered_from_selected_structure", errors)
+
+    def test_table_postprocess_normalizes_uncertainty_spacing(self):
+        rows, _ = postprocess_table_rows(
+            [{"Method": "A", "Accuracy": "27.4 ± 0.6"}], ["Method", "Accuracy"],
+            {"table_schema": [{"name": "Method", "is_row_key": True}, {"name": "Accuracy", "type": "string"}]},
+        )
+        self.assertEqual(rows, [{"Method": "A", "Accuracy": "27.4±0.6"}])
+
     def test_keyed_table_projection_respects_configured_row_and_view_limits(self):
         hierarchy = {
             "keyed_table_structure_enabled": True,
@@ -155,6 +447,35 @@ class PromptGroundingTests(unittest.TestCase):
         )
         self.assertEqual(prediction["evidence"], evidence)
 
+    def test_empty_evidence_is_filled_without_legacy_primary_type(self):
+        prediction, errors = standardize_symbolic_evidence(
+            {
+                "gold_papers": [{"paper_id": "paper"}],
+                "evidence": [],
+                "answer": {"table": {"rows": [{"method": "A"}]}},
+            },
+            {
+                "query_id": "q",
+                "question": "Report the table result.",
+                "answer_types": ["table"],
+                "table_schema": [{"name": "method", "type": "string"}],
+            },
+            [{
+                "paper_id": "paper",
+                "page": 3,
+                "source_type": "table",
+                "label": "Table 1",
+                "locator": {"page": 3, "table_id": "Table 1"},
+                "text": "| method |\\n| A |",
+            }],
+        )
+        self.assertEqual(prediction["evidence"], [{
+            "paper_id": "paper",
+            "source_type": "table",
+            "locator": {"page": 3, "table_id": "Table 1"},
+        }])
+        self.assertIn("symbolic_evidence_empty_filled", errors)
+
     def test_citation_locator_is_canonicalized_for_old_selection_cache(self):
         selected = [{
             "evidence_ref": "E0024", "paper_id": "paper", "source_type": "citation_context",
@@ -189,6 +510,7 @@ class PromptGroundingTests(unittest.TestCase):
             hierarchy,
         )
         self.assertEqual(grounded["table_answer_plan"][0]["row_evidence_ref"], "E0001")
+        self.assertEqual(grounded["table_answer_plan"][0], {"row_evidence_ref": "E0001", "values": {"Method": "MASTER"}})
         self.assertEqual(grounded["answer"]["freeform"]["text"], "MASTER")
         self.assertEqual(grounded["answer"]["table"]["rows"], [{"Method": "MASTER"}])
         self.assertTrue(any(row.get("status") == "table_plan_grounded" for row in audit))
@@ -392,9 +714,9 @@ class PromptGroundingTests(unittest.TestCase):
         source = inspect.getsource(_refine_keyed_draft)
         self.assertIn("_extract_json_object_with_suffix_repair", source)
 
-    def test_primary_table_enables_keyed_table_structure_for_freeform_contract(self):
+    def test_table_preference_enables_keyed_table_structure_for_freeform_contract(self):
         source = Path(__file__).with_name("generate_from_cached_selection.py").read_text(encoding="utf-8")
-        self.assertIn('or str(sample.get("primary_evidence_type") or "") == "table"', source)
+        self.assertIn('or "table" in task_structure.preferred_source_types', source)
 
     def test_query_replacement_preserves_other_queries(self):
         with tempfile.TemporaryDirectory() as directory:

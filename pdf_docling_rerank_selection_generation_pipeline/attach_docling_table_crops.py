@@ -44,6 +44,14 @@ def _docling_table_index(path: Path) -> dict[int, dict[str, Any]]:
     return {index: table for index, table in enumerate(tables, start=1) if isinstance(table, dict)}
 
 
+def _tables_on_page(table_index: dict[int, dict[str, Any]], page: int) -> list[tuple[int, dict[str, Any]]]:
+    return [
+        (index, table)
+        for index, table in table_index.items()
+        if (table.get("prov") or [{}])[0].get("page_no") == page
+    ]
+
+
 def _render_crop(pdf_path: Path, table: dict[str, Any], output_path: Path, dpi: int) -> bool:
     provenance = table.get("prov") if isinstance(table.get("prov"), list) else []
     if not provenance or not isinstance(provenance[0], dict):
@@ -92,8 +100,10 @@ def main() -> int:
             if not isinstance(record, dict) or str(record.get("source_type") or "") != "table":
                 continue
             paper_id = str(record.get("paper_id") or "")
-            number = _table_number((record.get("locator") or {}).get("table_id") if isinstance(record.get("locator"), dict) else record.get("label"))
-            if not paper_id or number is None:
+            locator = record.get("locator") if isinstance(record.get("locator"), dict) else {}
+            number = _table_number(locator.get("table_id") if isinstance(locator, dict) else record.get("label"))
+            page = locator.get("page") or record.get("page")
+            if not paper_id:
                 unresolved += 1
                 continue
             table_index = indices.get(paper_id)
@@ -101,8 +111,16 @@ def main() -> int:
                 raw = processed_root / paper_id / "raw_docling_output" / f"{paper_id}.docling.json"
                 table_index = _docling_table_index(raw)
                 indices[paper_id] = table_index
-            table = table_index.get(number)
-            crop_path = crop_root / paper_id / "raw_docling_output" / "table_crops" / f"table_{number:03d}.png"
+            table = table_index.get(number) if number is not None else None
+            # Page fallback: records without a "Table N" locator still carry a
+            # page; when the paper has exactly one docling table on that page,
+            # bind that table's bbox so the crop can be rendered.
+            if table is None and page is not None:
+                candidates = _tables_on_page(table_index, int(page))
+                if len(candidates) == 1:
+                    number, table = candidates[0]
+            crop_name = f"table_{number:03d}.png" if number is not None else f"table_p{int(page):02d}.png"
+            crop_path = crop_root / paper_id / "raw_docling_output" / "table_crops" / crop_name
             if table and not crop_path.is_file():
                 _render_crop(pdf_root / f"{paper_id}.pdf", table, crop_path, args.dpi)
             # Saving is best effort (some malformed PDFs acknowledge a render

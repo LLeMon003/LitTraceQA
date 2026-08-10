@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from .parser import extract_json_object
+from .task_structure import derive_task_structure
 
 
 def is_topic_profile_candidate(candidate: dict[str, Any]) -> bool:
@@ -69,8 +70,6 @@ def project_metadata_candidate(candidate: dict[str, Any]) -> dict[str, Any]:
 
 def build_metadata_selection_messages(sample: dict[str, Any], candidates: list[dict[str, Any]]) -> list[dict[str, str]]:
     payload = {
-        "task_family": sample.get("task_family"),
-        "primary_evidence_type": sample.get("primary_evidence_type"),
         "question": sample.get("question"),
         "answer_types": sample.get("answer_types", []),
         "candidate_papers": [project_metadata_candidate(candidate) for candidate in candidates],
@@ -109,8 +108,8 @@ def normalize_metadata_selection(
         row = {"paper_id": paper_id}
         if row not in papers:
             papers.append(row)
-    task_family = str(sample.get("task_family") or "").strip().lower().replace("-", "_")
-    if "multi" not in task_family and len(papers) > 1:
+    is_multi = derive_task_structure(sample).is_multi_paper
+    if not is_multi and len(papers) > 1:
         errors.append(
             {
                 "query_id": query_id,

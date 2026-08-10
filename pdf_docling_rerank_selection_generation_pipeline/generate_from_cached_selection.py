@@ -8,7 +8,7 @@ import json
 import re
 from collections import defaultdict
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from .config import load_pipeline_config
 from .data_io import extract_answer_contract, find_official_file, read_jsonl, write_jsonl
@@ -20,6 +20,7 @@ from .evidence_hierarchy import (
 from .metadata_index import tokenize
 from .parser import extract_json_object, make_fallback_prediction, normalize_prediction, strip_internal_grounding
 from .symbolic_context_selector import _compact_package_packets, grounding_label_from_record, project_context_for_vlm2
+from .task_structure import as_source_types, derive_task_structure
 
 
 GENERATION_PROVENANCE_VERSION = "v1_inference_inputs_only"
@@ -39,6 +40,7 @@ from .slot_generation import (
     bind_composition_support,
     deterministic_count_extraction,
     ensure_slot_cards,
+    plan_paper_package_routes,
     slot_composition_messages,
     slot_extraction_messages,
     slot_image_attachments,
@@ -51,6 +53,11 @@ from .slot_generation import (
 def _args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run answer generation from frozen selected records.")
     parser.add_argument("--official-dir", default="official_dev")
+    parser.add_argument(
+        "--inputs",
+        default="",
+        help="Input JSONL to run (e.g. official_dev/data/test.jsonl or test_extra.jsonl). Defaults to official validation_inputs.jsonl.",
+    )
     parser.add_argument("--selected-contexts-input", required=True)
     parser.add_argument("--candidate-papers-input", required=True)
     parser.add_argument(
@@ -59,6 +66,11 @@ def _args() -> argparse.Namespace:
         help="Optional sanitized answer-shape contracts (options/schema only; never gold answers).",
     )
     parser.add_argument("--hierarchy-input", default="", help="L0-L3 artifact produced by build_evidence_hierarchy.")
+    parser.add_argument(
+        "--slot-plans-input",
+        default="",
+        help="Frozen slot_plans.jsonl from the retrieval stage; reuse plans instead of re-planning at generation.",
+    )
     parser.add_argument(
         "--hierarchy-prompt-mode",
         choices=("legacy", "keyed"),
@@ -260,7 +272,7 @@ def _record_priority(
     record: dict[str, Any],
     query_terms: set[str],
     targets: dict[str, str],
-    primary_evidence_type: str,
+    preferred_source_types: Sequence[str],
     rank: int,
 ) -> tuple[float, bool]:
     source_type = str(record.get("source_type") or "")
@@ -268,10 +280,11 @@ def _record_priority(
     text = str(record.get("text") or "")
     terms = set(tokenize(" ".join((label, text))))
     overlap = len(query_terms.intersection(terms)) / max(1, len(query_terms))
+    preferred = set(as_source_types(preferred_source_types))
     # The original offline order is frozen-Qwen package order. It remains the
     # dominant signal; lexical/object signals only repair budget allocation.
     score = 4.0 / (1.0 + rank / 30.0) + 3.0 * overlap
-    if source_type == primary_evidence_type:
+    if source_type in preferred:
         score += 0.9
     target = targets.get(source_type)
     direct_target = bool(target and re.search(rf"\b{re.escape(target)}\b", f"{label}\n{text}", re.IGNORECASE))
@@ -287,8 +300,8 @@ def _record_priority(
 def _prompt_records_coverage(
     records: list[dict[str, Any]],
     query: str,
-    primary_evidence_type: str | None,
-    task_family: str | None,
+    preferred_source_types: Sequence[str],
+    is_multi_paper: bool,
     budget: int,
 ) -> list[dict[str, Any]]:
     """Pack frozen-Qwen records under a real prompt budget without gold access.
@@ -301,8 +314,8 @@ def _prompt_records_coverage(
     """
     query_terms = set(tokenize(query))
     targets = _query_targets(query)
-    primary = to_official_source_type(source_type=primary_evidence_type) or str(primary_evidence_type or "")
-    is_multi = "multi" in str(task_family or "").lower()
+    preferred = set(as_source_types(preferred_source_types))
+    is_multi = bool(is_multi_paper)
     unique: dict[str, tuple[int, dict[str, Any]]] = {}
     for rank, raw in enumerate(records, start=1):
         source_type = to_official_source_type(raw.get("record_type"), raw.get("source_type"))
@@ -316,7 +329,7 @@ def _prompt_records_coverage(
 
     prepared: list[dict[str, Any]] = []
     for rank, record in unique.values():
-        priority, direct_target = _record_priority(record, query_terms, targets, primary, rank)
+        priority, direct_target = _record_priority(record, query_terms, targets, preferred, rank)
         prepared.append({
             "record": record,
             "priority": priority,
@@ -365,9 +378,10 @@ def _prompt_records_coverage(
         paper_order = sorted(by_paper, key=lambda paper_id: (-by_paper[paper_id][0]["priority"], paper_id))
         for paper_id in paper_order:
             add(by_paper[paper_id][0])
-    # Preserve the explicitly requested source type when it exists.
-    if primary in by_type:
-        add(by_type[primary][0])
+    # Preserve the query-conditioned source types when they exist.
+    for source_type in preferred:
+        if source_type in by_type:
+            add(by_type[source_type][0])
 
     while True:
         remaining = [item for item in prepared if str(item["record"].get("global_record_id") or item["record"].get("record_id") or "") not in selected_ids]
@@ -376,7 +390,7 @@ def _prompt_records_coverage(
 
         def utility(item: dict[str, Any]) -> tuple[float, float, float]:
             gain = 0.0
-            if item["source_type"] == primary and item["source_type"] not in selected_types:
+            if item["source_type"] in preferred and item["source_type"] not in selected_types:
                 gain += 1.8
             if is_multi and item["paper_id"] not in selected_papers:
                 gain += 1.2
@@ -470,6 +484,8 @@ def _fit_hierarchy_to_prompt(
     max_prompt_chars: int,
     max_images: int,
     keyed_mode: bool = False,
+    multi_paper_task: bool | None = None,
+    preferred_source_types: Sequence[str] | None = None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any], list[dict[str, Any]]]:
     """Fit an L2 prompt while retaining the complete off-prompt L0 catalog."""
     cards = list(hierarchy.get("l2_evidence_cards") or [])
@@ -480,6 +496,7 @@ def _fit_hierarchy_to_prompt(
     # still needs a finite high bound, well above any current selected L2
     # index, instead of silently restoring the legacy 48k cap.
     max_micro_chars = 250000 if configured_micro_chars is None or int(configured_micro_chars) == 0 else int(configured_micro_chars)
+    preferred = set(as_source_types(preferred_source_types))
 
     # Prime query-aware micro priorities once on the base hierarchy. Subsequent
     # binary-search projections deep-copy this tiny cache instead of tokenizing
@@ -510,8 +527,7 @@ def _fit_hierarchy_to_prompt(
         prompt_evidence = [record for record in evidence if str(record.get("evidence_ref") or "") in visible_refs]
         # Attach scarce visual slots to the query's requested modality first.
         # This changes only attachment order, never L2 key order or selection.
-        primary_type = str(sample.get("primary_evidence_type") or "")
-        prompt_evidence.sort(key=lambda record: str(record.get("source_type") or "") != primary_type)
+        prompt_evidence.sort(key=lambda record: str(record.get("source_type") or "") not in preferred)
         context = _selected_context(
             [dict(record) for record in prompt_evidence],
             # Keyed L2 cards remain the sole provenance keys, but the linked
@@ -523,7 +539,15 @@ def _fit_hierarchy_to_prompt(
             evidence_hierarchy=current,
         )
         messages = build_symbolic_answer_prompt(
-            sample, candidates, context, False, "docling", config.answer_model, contract,
+            sample,
+            candidates,
+            context,
+            False,
+            "docling",
+            config.answer_model,
+            contract,
+            multi_paper_task=multi_paper_task,
+            preferred_source_types=preferred,
         )
         return prompt_evidence, context, messages
 
@@ -575,7 +599,15 @@ def _fit_hierarchy_to_prompt(
             evidence_hierarchy=current,
         )
         messages = build_symbolic_answer_prompt(
-            sample, candidates, context, bool(context.get("attached_image_paths")), "docling", config.answer_model, contract,
+            sample,
+            candidates,
+            context,
+            bool(context.get("attached_image_paths")),
+            "docling",
+            config.answer_model,
+            contract,
+            multi_paper_task=multi_paper_task,
+            preferred_source_types=preferred,
         )
         chars = sum(len(str(message.get("content") or "")) for message in messages)
         if max_prompt_chars <= 0 or chars <= max_prompt_chars:
@@ -668,7 +700,12 @@ def _posthoc_ground_keyed_prediction(
     by_ref = {str(row.get("evidence_ref") or ""): row for row in hierarchy.get("l0_catalog") or []}
     card_metadata = projection.get("_card_metadata") or {}
     claim_text = " ".join(str(item.get("claim") or "") for item in hierarchy.get("query_claims") or [] if isinstance(item, dict))
-    primary_source_type = str(hierarchy.get("primary_evidence_type") or "")
+    hierarchy_preferred = tuple(as_source_types(hierarchy.get("preferred_source_types") or ()))
+    primary_source_type = (
+        hierarchy_preferred[0]
+        if hierarchy_preferred
+        else str(hierarchy.get("primary_evidence_type") or "")
+    )
     explicit_object_claim = bool(re.search(r"\b(?:explicitly\s+(?:mention|reference)|explicit\s+(?:mention|reference)|labeled?|named)\b", claim_text, re.IGNORECASE))
     required_anchor_terms = {term.lower() for term in re.findall(r"\b[A-Z][A-Z0-9-]{1,}\b", claim_text) if term.upper() not in {"PDF", "QA"}}
     venue_match = re.search(r"\b(ACL|NAACL|EMNLP|ICLR|ICML|NEURIPS)\s*(20\d{2})\b", claim_text, re.IGNORECASE)
@@ -741,12 +778,6 @@ def _posthoc_ground_keyed_prediction(
         if not record:
             audit.append({"table_support_key": card_key, "status": "table_plan_ungrounded"})
             continue
-        row_source = {
-            "paper_id": record.get("paper_id"),
-            "page": record.get("page"),
-            "label": record.get("label"),
-            "source_type": record.get("source_type"),
-        }
         values = raw.get("values") if isinstance(raw.get("values"), dict) else {}
         if any(str(column).strip().lower() == "paper title" for column in values):
             metadata = card_metadata.get(card_key) or {}
@@ -761,7 +792,7 @@ def _posthoc_ground_keyed_prediction(
                     "anchor_ok": anchor_ok,
                 })
                 continue
-        cleaned_plan.append({"row_evidence_ref": support_ref, "row_source": row_source, "values": values})
+        cleaned_plan.append({"row_evidence_ref": support_ref, "values": values})
         if str((projection.get("_card_metadata", {}).get(card_key) or {}).get("verification_status") or "") == "visual_verified":
             visual_card_keys.append(card_key)
         if support_ref not in grounded["evidence_refs"]:
@@ -991,7 +1022,7 @@ def _keyed_refinement_messages(
         "You are a post-hoc factual verifier. The draft was produced from compressed evidence keys. "
         "Revise it only when the resolved raw evidence below directly contradicts or completes it. Do not add facts, papers, values, rows, or evidence beyond resolved_evidence. "
         "Return JSON only with query_id, gold_papers, evidence_refs, answer, and table_answer_plan when table is required. "
-        "evidence_refs must contain only provided E#### strings. For a table answer, output at most 16 plan rows; each has row_evidence_ref copied from resolved_evidence, row_source with its provided paper/page/label, and values using exactly table_schema columns.\n"
+        "evidence_refs must contain only provided E#### strings. For a table answer, output at most 16 plan rows; each has row_evidence_ref copied from resolved_evidence and values using exactly table_schema columns. The runtime restores source, page, and locator from row_evidence_ref.\n"
         f"INPUT:{json.dumps(payload, ensure_ascii=False, separators=(',', ':'))}"
     )
     return [{"role": "system", "content": "Return valid JSON only."}, {"role": "user", "content": user}]
@@ -1042,6 +1073,8 @@ def _bounded_messages(
     config: Any,
     contract: dict[str, Any],
     max_prompt_chars: int,
+    multi_paper_task: bool | None = None,
+    preferred_source_types: Sequence[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Keep the highest-ranked prefix that fits the actual serialized prompt."""
 
@@ -1054,6 +1087,8 @@ def _bounded_messages(
             "docling",
             config.answer_model,
             contract,
+            multi_paper_task=multi_paper_task,
+            preferred_source_types=preferred_source_types,
         )
 
     if max_prompt_chars <= 0:
@@ -1080,6 +1115,8 @@ def _fit_coverage_to_prompt(
     config: Any,
     contract: dict[str, Any],
     max_prompt_chars: int,
+    multi_paper_task: bool | None = None,
+    preferred_source_types: Sequence[str] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     """Fit records in coverage order against the serialized prompt, not a proxy.
 
@@ -1088,14 +1125,26 @@ def _fit_coverage_to_prompt(
     prevents a final prefix truncation from undoing the allocator's diversity.
     """
     if max_prompt_chars <= 0:
-        return evidence, _bounded_messages(sample, candidates, evidence, config, contract, max_prompt_chars)[1]
+        return evidence, _bounded_messages(
+            sample, candidates, evidence, config, contract, max_prompt_chars,
+            multi_paper_task=multi_paper_task,
+            preferred_source_types=preferred_source_types,
+        )[1]
     accepted: list[dict[str, Any]] = []
-    messages = _bounded_messages(sample, candidates, [], config, contract, 0)[1]
+    messages = _bounded_messages(
+        sample, candidates, [], config, contract, 0,
+        multi_paper_task=multi_paper_task,
+        preferred_source_types=preferred_source_types,
+    )[1]
     for record in evidence:
         proposed = [*accepted, record]
         # max_prompt_chars=0 requests one exact serialization without the
         # binary-prefix fitting used by the legacy helper.
-        _, proposed_messages = _bounded_messages(sample, candidates, proposed, config, contract, 0)
+        _, proposed_messages = _bounded_messages(
+            sample, candidates, proposed, config, contract, 0,
+            multi_paper_task=multi_paper_task,
+            preferred_source_types=preferred_source_types,
+        )
         serialized = sum(len(str(message.get("content") or "")) for message in proposed_messages)
         if serialized <= max_prompt_chars:
             accepted = proposed
@@ -1250,7 +1299,11 @@ def main() -> int:
     output.mkdir(parents=True, exist_ok=True)
     only = {part.strip() for part in args.only_query_ids.split(",") if part.strip()}
     retry_query_ids = {part.strip() for part in args.retry_query_ids.split(",") if part.strip()}
-    validation_inputs_path = find_official_file(args.official_dir, "validation_inputs.jsonl")
+    validation_inputs_path = (
+        Path(args.inputs)
+        if args.inputs
+        else find_official_file(args.official_dir, "validation_inputs.jsonl")
+    )
     selected_contexts_path = Path(args.selected_contexts_input)
     candidate_papers_path = Path(args.candidate_papers_input)
     hierarchy_path = Path(args.hierarchy_input) if args.hierarchy_input else None
@@ -1288,6 +1341,11 @@ def main() -> int:
         for row in read_jsonl(hierarchy_path)
         if isinstance(row.get("hierarchy"), dict)
     } if args.hierarchy_input else {}
+    frozen_plans = {
+        str(row.get("query_id") or ""): row.get("plan")
+        for row in read_jsonl(args.slot_plans_input)
+        if isinstance(row.get("plan"), dict)
+    } if args.slot_plans_input else {}
     candidates_by_query = _candidate_map(candidate_papers_path)
     answer_contracts = {
         str(row.get("query_id") or ""): row
@@ -1343,6 +1401,8 @@ def main() -> int:
             continue
         candidates = candidates_by_query.get(query_id, [])
         hierarchy = hierarchies.get(query_id)
+        frozen_plan = frozen_plans.get(query_id)
+        task_structure = derive_task_structure(sample, frozen_plan)
         records = (selections.get(query_id) or {}).get("selected_records") or []
         raw_records = [row for row in records if isinstance(row, dict)]
         if hierarchy:
@@ -1352,8 +1412,8 @@ def main() -> int:
             evidence = _prompt_records_coverage(
                 raw_records,
                 str(sample.get("question") or sample.get("query") or ""),
-                sample.get("primary_evidence_type"),
-                sample.get("task_family"),
+                task_structure.preferred_source_types,
+                task_structure.is_multi_paper,
                 args.record_text_budget if args.record_text_budget > 0 else args.max_context_chars,
             )
         else:
@@ -1374,7 +1434,7 @@ def main() -> int:
             # primary source, rather than exposing only a caption.
             hierarchy["keyed_table_structure_enabled"] = (
                 "table" in (contract.get("answer_types") or [])
-                or str(sample.get("primary_evidence_type") or "") == "table"
+                or "table" in task_structure.preferred_source_types
             )
             if args.keyed_micro_text_chars is not None:
                 hierarchy["keyed_micro_text_chars"] = max(40, args.keyed_micro_text_chars)
@@ -1384,17 +1444,17 @@ def main() -> int:
                 hierarchy["keyed_micro_index_chars"] = max(0, args.keyed_micro_index_chars)
             if args.keyed_card_limit is not None:
                 cards = list(hierarchy.get("l2_evidence_cards") or [])
-                primary = str(sample.get("primary_evidence_type") or "")
+                preferred_types = set(task_structure.preferred_source_types)
                 # A verified visual card is the only L2 source allowed to
                 # carry crop-only facts. Prefer it within the query's primary
                 # modality, while preserving tables as the primary choice for
                 # normal table questions and never changing frozen selection.
                 cards.sort(key=lambda card: (
-                    str(card.get("source_type") or "") != primary,
+                    str(card.get("source_type") or "") not in preferred_types,
                     str((card.get("verification") or {}).get("status") or "") != "visual_verified",
                 ))
-                if "multi" in str(sample.get("task_family") or "").lower():
-                    preferred = [card for card in cards if str(card.get("source_type") or "") == primary]
+                if task_structure.is_multi_paper:
+                    preferred = [card for card in cards if str(card.get("source_type") or "") in preferred_types]
                     fallback = [card for card in cards if card not in preferred]
                     # A multi-paper answer needs independent evidence from
                     # several papers. Preserve one primary-type card per paper
@@ -1419,6 +1479,8 @@ def main() -> int:
             hierarchy, evidence, selected_context, messages = _fit_hierarchy_to_prompt(
                 sample, candidates, evidence, hierarchy, config, contract, args.max_prompt_chars,
                 max_images=max_images, keyed_mode=args.hierarchy_prompt_mode == "keyed",
+                multi_paper_task=task_structure.is_multi_paper,
+                preferred_source_types=task_structure.preferred_source_types,
             )
             if slot_hierarchy is not None:
                 # Prompt fitting controls the legacy preview only. Slot calls
@@ -1428,6 +1490,8 @@ def main() -> int:
         else:
             evidence, messages = _fit_coverage_to_prompt(
                 sample, candidates, evidence, config, contract, args.max_prompt_chars,
+                multi_paper_task=task_structure.is_multi_paper,
+                preferred_source_types=task_structure.preferred_source_types,
             )
             selected_context = _selected_context(evidence)
         prompt_chars = sum(len(str(message.get("content") or "")) for message in messages)
@@ -1447,15 +1511,31 @@ def main() -> int:
             if args.generation_mode == "slots":
                 if not hierarchy or args.hierarchy_prompt_mode != "keyed":
                     raise ValueError("--generation-mode slots requires --hierarchy-input and --hierarchy-prompt-mode keyed")
-                raw_plan, _result, raw_attempts = _generate_json_draft(
-                    client, slot_plan_messages(sample, contract), None,
-                    config.generation_parse_max_retries,
-                )
-                raw_rows.extend({"query_id": query_id, "phase": "slot_plan", **attempt} for attempt in raw_attempts)
-                plan, plan_audit = validate_slot_plan(raw_plan, sample, candidates)
+                frozen = frozen_plans.get(query_id)
+                if frozen is not None:
+                    plan = frozen
+                    plan_audit = [{"status": "slot_plan_reused_frozen", "source": args.slot_plans_input}]
+                else:
+                    raw_plan, _result, raw_attempts = _generate_json_draft(
+                        client, slot_plan_messages(sample, contract), None,
+                        config.generation_parse_max_retries,
+                    )
+                    raw_rows.extend({"query_id": query_id, "phase": "slot_plan", **attempt} for attempt in raw_attempts)
+                    plan, plan_audit = validate_slot_plan(raw_plan, sample, candidates)
                 slot_plans.append({"query_id": query_id, "plan": plan, "audit": plan_audit})
+                route_by_slot = {
+                    str(route["slot_id"]): str(route["paper_id"])
+                    for route in plan_paper_package_routes(
+                        plan, candidates, str(sample.get("question") or sample.get("query") or "")
+                    )
+                }
+                execution_slots = [
+                    {**slot, "routed_paper_id": route_by_slot[slot["id"]]}
+                    if str(slot.get("id") or "") in route_by_slot else slot
+                    for slot in plan["slots"]
+                ]
                 extracted_slots: list[dict[str, Any]] = []
-                for slot in plan["slots"]:
+                for slot in execution_slots:
                     if slot.get("operation") in ("count", "direct"):
                         deterministic = deterministic_count_extraction(
                             slot, hierarchy, str(sample.get("question") or ""), candidates
@@ -1480,7 +1560,6 @@ def main() -> int:
                         if config.vlm2_context_mode == "cropped_image" else None
                     )
                     slot_images = [str(row["path"]) for row in slot_attachments or []]
-                    table_schema = (contract.get("table") or {}).get("table_schema")
                     extracted = None
                     extraction_audit: list[dict[str, Any]] = []
                     for card_limit in (24, 48):
@@ -1488,14 +1567,14 @@ def main() -> int:
                             client,
                             slot_extraction_messages(
                                 sample, slot, hierarchy, candidates, slot_attachments,
-                                table_schema=table_schema, card_limit=card_limit,
+                                card_limit=card_limit,
                             ),
                             slot_images,
                             config.generation_parse_max_retries,
                         )
                         raw_rows.extend({"query_id": query_id, "phase": f"slot_extract:{slot['id']}", **attempt} for attempt in raw_attempts)
                         extracted, extraction_audit = validate_slot_extraction(
-                            raw_slot, slot, hierarchy, table_schema=table_schema
+                            raw_slot, slot, hierarchy
                         )
                         if extracted["status"] == "supported" or card_limit == 48:
                             break

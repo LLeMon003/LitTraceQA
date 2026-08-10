@@ -4,12 +4,13 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from .metadata_index import BM25Okapi, tokenize
 from .object_references import object_reference_paragraphs, same_object_label
 from .section_relevance import query_object_targets
 from .symbolic_schema import OFFICIAL_EVIDENCE_SOURCE_TYPES, to_official_source_type
+from .task_structure import as_source_types, explicit_source_type_mentions
 
 
 @dataclass(frozen=True)
@@ -188,6 +189,49 @@ def _package_text(package: dict[str, Any]) -> str:
     return " ".join(parts)
 
 
+def _table_route_condition_score(package: dict[str, Any], route_query: str, question: str = "") -> int:
+    """Prefer a table column that jointly satisfies explicit dataset and IPC."""
+    if package.get("source_type") != "table":
+        return 0
+    text = _package_text(package).lower()
+    if re.search(r"\b(?:test\s+)?accuracy\b", f"{route_query} {question}", re.IGNORECASE):
+        if not re.search(r"\baccuracy\b", text) and re.search(r"\b(?:speed|memory|latency|runtime)\b", text):
+            return -1
+        # For a named benchmark, a table whose *column* names that benchmark
+        # is more likely to contain the requested metric than a few-shot or
+        # ablation table that merely mentions it in its caption.
+        datasets = {
+            re.sub(r"[^a-z0-9]+", "", token.lower())
+            for token in re.findall(r"\b[A-Za-z]+(?:-[A-Za-z]+)*-?\d+\b", route_query)
+        }
+        for record in package.get("records") or []:
+            structure = record.get("table_structure") if isinstance(record.get("table_structure"), dict) else {}
+            normalized_columns = [re.sub(r"[^a-z0-9]+", "", str(column).lower()) for column in structure.get("columns") or []]
+            matched_columns = sum(
+                dataset and dataset in column
+                for dataset in datasets
+                for column in normalized_columns
+            )
+            if matched_columns:
+                return min(3, 1 + matched_columns)
+        if any(dataset and dataset in re.sub(r"[^a-z0-9]+", "", text) for dataset in datasets):
+            return 1
+    dataset = re.search(r"\bdataset\s*:\s*([A-Za-z][\w-]*(?:\s+[A-Za-z][\w-]*){0,3})", route_query, re.IGNORECASE)
+    ipc = re.search(r"\bipc\s*[=:]\s*(\d+)\b", route_query, re.IGNORECASE)
+    if dataset is None or ipc is None:
+        return 0
+    dataset_text = re.sub(r"[^a-z0-9]+", "", dataset.group(1).lower())
+    for record in package.get("records") or []:
+        structure = record.get("table_structure") if isinstance(record.get("table_structure"), dict) else {}
+        for column in structure.get("columns") or []:
+            column_text = str(column).lower()
+            if dataset_text in re.sub(r"[^a-z0-9]+", "", column_text) and re.search(rf"(?<!\d){re.escape(ipc.group(1))}(?!\d)", column_text):
+                return 2
+    if dataset_text in re.sub(r"[^a-z0-9]+", "", text) and re.search(r"\bipc\b", text) and re.search(rf"(?<!\d){re.escape(ipc.group(1))}(?!\d)", text):
+        return 1
+    return 0
+
+
 def _matches_target(package: dict[str, Any], targets: dict[str, Any]) -> bool:
     source_type = str(package.get("source_type") or "")
     target = targets.get(source_type)
@@ -197,21 +241,12 @@ def _matches_target(package: dict[str, Any], targets: dict[str, Any]) -> bool:
     return bool(re.search(rf"\b{re.escape(str(target))}\b", label))
 
 
-def _requested_modalities(query: str, primary_evidence_type: str | None) -> set[str]:
-    text = str(query or "").lower()
-    modalities: set[str] = set()
-    patterns = {
-        "table": r"\btable\b|\btab\.",
-        "figure": r"\bfigure\b|\bfig\.",
-        "equation_algorithm": r"\bequation\b|\beq\.\b|\balgorithm\b|\bobjective\b",
-        "citation_context": r"\bcitation\b|\bcited\b|\breference\b|\bref\.\b|\bauthor\b",
-    }
-    for source_type, pattern in patterns.items():
-        if re.search(pattern, text):
-            modalities.add(source_type)
-    primary = to_official_source_type(source_type=primary_evidence_type)
-    if primary:
-        modalities.add(primary)
+def _requested_modalities(query: str, preferred_source_types: Sequence[str] | None = None) -> set[str]:
+    # Output shape never supplies a modality.  Packages are constrained only
+    # by validated slot types plus an explicit numbered object in the public
+    # question (for example "Table 3"), not generic words like "objective".
+    modalities = set(explicit_source_type_mentions(query))
+    modalities.update(as_source_types(preferred_source_types))
     return modalities or {"text_span"}
 
 
@@ -275,20 +310,31 @@ def _rrf_pool(rankings: list[list[int]], config: EvidencePackageConfig) -> set[i
 def select_packages(
     *,
     query: str,
+    source_hint_query: str | None = None,
     packages: list[dict[str, Any]],
-    primary_evidence_type: str | None,
+    primary_evidence_type: str | None = None,
+    preferred_source_types: Sequence[str] | None = None,
     is_multi_paper_task: bool,
     route_queries: list[str],
+    slot_route_queries: list[tuple[str, tuple[str, ...]]] | None = None,
+    catalog_fallback_slot_route_queries: list[tuple[str, tuple[str, ...]]] | None = None,
+    slot_paper_route_queries: list[tuple[str, str, tuple[str, ...]]] | None = None,
     paper_route_queries: list[tuple[str, str]] | None = None,
     paper_local_route_queries: list[tuple[str, str]] | None = None,
     config: EvidencePackageConfig,
 ) -> dict[str, Any]:
     if not packages:
         return {"packages": [], "records": [], "trace": {"candidate_package_count": 0}}
+    preferred = tuple(
+        as_source_types(preferred_source_types if preferred_source_types is not None else primary_evidence_type)
+    )
     texts = [_package_text(package) for package in packages]
     bm25 = BM25Okapi([tokenize(text) for text in texts])
     rankings: list[list[int]] = []
     claim_rankings: list[list[int]] = []
+    slot_route_rankings: list[list[int]] = []
+    catalog_fallback_slot_route_rankings: list[list[int]] = []
+    slot_paper_route_rankings: list[list[int]] = []
     paper_claim_rankings: list[list[int]] = []
     paper_local_rankings: list[list[int]] = []
     routing_queries = list(dict.fromkeys([query, *route_queries]))
@@ -298,6 +344,43 @@ def select_packages(
         rankings.append(ranking)
         if route_index:
             claim_rankings.append(ranking)
+    for route_query, source_types in slot_route_queries or []:
+        allowed = set(source_types)
+        scores = bm25.get_scores(tokenize(route_query))
+        ranking = [
+            index
+            for index in sorted(range(len(packages)), key=lambda index: (-scores[index], index))
+            if not allowed or packages[index]["source_type"] in allowed
+        ]
+        if ranking:
+            rankings.append(ranking)
+            slot_route_rankings.append(ranking)
+    for route_query, source_types in catalog_fallback_slot_route_queries or []:
+        allowed = set(source_types)
+        scores = bm25.get_scores(tokenize(route_query))
+        ranking = [
+            index
+            for index in sorted(range(len(packages)), key=lambda index: (-scores[index], index))
+            if not allowed or packages[index]["source_type"] in allowed
+        ]
+        if ranking:
+            rankings.append(ranking)
+            catalog_fallback_slot_route_rankings.append(ranking)
+    for paper_id, route_query, source_types in slot_paper_route_queries or []:
+        allowed = set(source_types)
+        scores = bm25.get_scores(tokenize(route_query))
+        ranking = [
+            index
+            for index in sorted(
+                range(len(packages)),
+                key=lambda index: (-_table_route_condition_score(packages[index], route_query, query), -scores[index], index),
+            )
+            if str(packages[index].get("paper_id") or "") == str(paper_id)
+            and (not allowed or packages[index]["source_type"] in allowed)
+        ]
+        if ranking:
+            rankings.append(ranking)
+            slot_paper_route_rankings.append(ranking)
     for paper_id, route_query in paper_route_queries or []:
         scores = bm25.get_scores(tokenize(route_query))
         ranking = [
@@ -331,8 +414,9 @@ def select_packages(
             source_route_count += 1
     qwen_ranking = sorted(range(len(packages)), key=lambda index: (-_score(packages[index]), index))
     rankings.append(qwen_ranking)
-    targets = query_object_targets(query)
-    modalities = _requested_modalities(query, primary_evidence_type)
+    source_hint = source_hint_query if source_hint_query is not None else query
+    targets = query_object_targets(source_hint)
+    modalities = _requested_modalities(source_hint, preferred)
     layout_types = _layout_section_types(query)
     for modality in sorted(modalities):
         matching = [index for index, package in enumerate(packages) if package["source_type"] == modality]
@@ -363,7 +447,8 @@ def select_packages(
             index,
         ),
     )
-    budget = max(1, config.package_budget)
+    required_slot_rankings = [*slot_paper_route_rankings, *slot_route_rankings, *catalog_fallback_slot_route_rankings]
+    budget = max(1, config.package_budget, len(required_slot_rankings))
     min_budget = min(budget, max(1, config.min_package_budget))
     paper_target = min(budget, max(1, config.min_distinct_papers if is_multi_paper_task else 1))
     selected_indexes: list[int] = []
@@ -380,6 +465,18 @@ def select_packages(
         page_counts[page_key] += 1
         return True
 
+    slot_route_selected_count = 0
+    catalog_fallback_slot_route_selected_count = 0
+    slot_paper_route_selected_count = 0
+    for ranking in slot_paper_route_rankings:
+        if any(index in selected_indexes for index in ranking) or any(add(index) for index in ranking):
+            slot_paper_route_selected_count += 1
+    for ranking in slot_route_rankings:
+        if any(index in selected_indexes for index in ranking) or any(add(index) for index in ranking):
+            slot_route_selected_count += 1
+    for ranking in catalog_fallback_slot_route_rankings:
+        if any(add(index) for index in ranking):
+            catalog_fallback_slot_route_selected_count += 1
     for index in sorted(targeted, key=lambda item: (-_score(packages[item], packages[item]["source_type"]), item)):
         add(index, force=True)
     for modality in sorted(modalities):
@@ -522,6 +619,12 @@ def select_packages(
             "route_count": len(rankings),
             "source_route_count": source_route_count,
             "hyde_claim_route_count": len(claim_rankings),
+            "slot_route_count": len(slot_route_rankings),
+            "slot_route_selected_count": slot_route_selected_count,
+            "catalog_fallback_slot_route_count": len(catalog_fallback_slot_route_rankings),
+            "catalog_fallback_slot_route_selected_count": catalog_fallback_slot_route_selected_count,
+            "slot_paper_route_count": len(slot_paper_route_rankings),
+            "slot_paper_route_selected_count": slot_paper_route_selected_count,
             "paper_conditioned_claim_route_count": len(paper_claim_rankings),
             "paper_local_bm25_route_count": len(paper_local_rankings),
             "targeted_package_count": len(targeted),

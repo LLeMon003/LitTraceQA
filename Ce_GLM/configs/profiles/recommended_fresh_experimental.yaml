@@ -1,0 +1,14 @@
+profile: RECOMMENDED_FRESH_EXPERIMENTAL
+purpose: Use the best justified prompt/context/model configuration from the causal experiment.
+model: deepseek-ai/DeepSeek-V3.2
+endpoint: https://api.siliconflow.cn/v1
+temperature: 0
+retrieval: no rerun; use frozen retrieved paper/PDF context
+context_policy: localized C1 object/page context
+mc_option_policy: ordered options in prompt with explicit letter and semantic answer contract
+table_policy: family-specific schema-preserving table instruction
+freeform_policy: family-specific requested-component completeness instruction
+evidence_policy: explicit provenance fields
+expected_output: experimental fresh predictions only
+resume_behavior: condition/query-pair resumable runner
+limitations: pilot-level evidence only; does not replace frozen Version 2

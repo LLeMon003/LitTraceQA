@@ -176,6 +176,35 @@ class EvidenceHierarchyTests(unittest.TestCase):
         self.assertEqual(rows, [{"Paper Title": "Canonical Paper Title"}])
         self.assertIn("table_paper_title_row_key_canonicalized", errors)
 
+    def test_table_rows_remap_variant_column_names_and_coerce_numbers(self):
+        from .parser import _rows_from_table_answer_plan, postprocess_table_rows
+        schema = ["dataset", "ndcg_at_10", "map_at_10"]
+        raw_input = {
+            "table_schema": [
+                {"name": "dataset", "type": "string", "is_row_key": True},
+                {"name": "ndcg_at_10", "type": "number", "is_row_key": False},
+                {"name": "map_at_10", "type": "number", "is_row_key": False},
+            ]
+        }
+        plan_rows = _rows_from_table_answer_plan(
+            [{"values": {"dataset": "SciFact", "NDCG@10": "62.5", "MAP@10": "0.6 GB"}}],
+            schema,
+        )
+        rows, errors = postprocess_table_rows(plan_rows, schema, raw_input)
+        self.assertEqual(rows, [{"dataset": "SciFact", "ndcg_at_10": 62.5, "map_at_10": 0.6}])
+
+    def test_string_table_cell_keeps_verbatim_text(self):
+        from .parser import postprocess_table_rows
+        rows, _ = postprocess_table_rows(
+            [{"method": "A", "value": "14.70"}],
+            ["method", "value"],
+            {"table_schema": [
+                {"name": "method", "type": "string", "is_row_key": True},
+                {"name": "value", "type": "string", "is_row_key": False},
+            ]},
+        )
+        self.assertEqual(rows, [{"method": "A", "value": "14.70"}])
+
     def test_micro_proposition_selects_query_relevant_sentence_not_prefix(self):
         record = {
             "text": "Proceedings of the conference. We use an AdamW optimizer with learning rate 0.001 for all runs.",

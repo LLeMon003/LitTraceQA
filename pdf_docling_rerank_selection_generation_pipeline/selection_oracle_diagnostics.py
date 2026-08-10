@@ -18,6 +18,7 @@ from .evidence_packages import _anchor_score_tracks, _order, _package_records, c
 from .extraction_selection_evaluation import _candidate_records, _gold_evidence, _load_extraction_records
 from .metadata_index import BM25Okapi, tokenize
 from .symbolic_context_selector import _is_header_footer_record, _query_needs_header_footer
+from .task_structure import derive_task_structure
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +40,7 @@ def _split_ids(raw: str) -> set[str]:
 
 
 def _is_multi_paper(validation_input: dict[str, Any]) -> bool:
-    return "multi" in str(validation_input.get("task_family") or "").lower()
+    return derive_task_structure(validation_input).is_multi_paper
 
 
 def _valid_records(records: list[dict[str, Any]], query: str) -> list[dict[str, Any]]:

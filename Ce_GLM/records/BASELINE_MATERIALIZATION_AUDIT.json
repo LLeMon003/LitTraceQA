@@ -1,0 +1,20 @@
+{
+  "archive_member_count": 37,
+  "created_at_utc": "2026-07-18T17:09:40.674112+00:00",
+  "extra_approved_identity_files": [
+    "BASELINE_MANIFEST.json",
+    "BASELINE_POLICY.md",
+    "BASELINE_PROVENANCE.md",
+    "BASELINE_VERSION",
+    "records/BASELINE_CLEAN_ROOM_VALIDATION.json",
+    "records/BASELINE_MATERIALIZATION_AUDIT.json",
+    "records/BASELINE_SECURITY_AUDIT.json",
+    "records/GIT_HANDOFF_STATUS.json"
+  ],
+  "extracted_file_count": 37,
+  "matched_hashes": 37,
+  "mismatched_hashes": [],
+  "missing_files": [],
+  "status": "PASS",
+  "unexpected_extra_files": []
+}

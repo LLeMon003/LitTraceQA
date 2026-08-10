@@ -19,6 +19,7 @@ from .parser import extract_json_object
 from .symbolic_context_selector import grounding_label_from_record
 from .symbolic_schema import canonicalize_locator, to_official_source_type
 from .table_structure import table_text_to_structure
+from .task_structure import as_source_types
 
 
 HIERARCHY_VERSION = "l0_l1_l2_l3_v3_contextual_triples"
@@ -537,8 +538,9 @@ def _rank_extractive_fragments(
     question: str,
     catalog: list[dict[str, Any]],
     l1_by_anchor: dict[str, dict[str, Any]],
-    primary_evidence_type: str = "",
+    preferred_source_types: Iterable[str] | str = (),
 ) -> list[dict[str, Any]]:
+    preferred = set(as_source_types(preferred_source_types))
     query_terms = set(tokenize(question))
     fragments: list[dict[str, Any]] = []
     for record in catalog:
@@ -559,7 +561,7 @@ def _rank_extractive_fragments(
                 # no lexical overlap. This is a bounded extractive route, not
                 # a score replacement for frozen Qwen selection.
                 table_bonus = 3 if query_terms.intersection({"f1", "score", "accuracy", "benchmark", "outperform", "how", "much"}) else 0
-                if source_type == primary_evidence_type:
+                if "table" in preferred:
                     table_bonus += 3
                 fragments.append({
                     "evidence_ref": ref,
@@ -577,8 +579,8 @@ def _rank_extractive_fragments(
                 continue
             overlap = len(query_terms.intersection(tokenize(sentence)))
             label_bonus = 2 if any(term in str(record.get("label") or "").lower() for term in query_terms) else 0
-            primary_bonus = 2 if source_type == primary_evidence_type else 0
-            fragments.append({"evidence_ref": ref, "text": _clip(sentence, 420), "score": overlap + label_bonus + primary_bonus})
+            preferred_bonus = 2 if source_type in preferred else 0
+            fragments.append({"evidence_ref": ref, "text": _clip(sentence, 420), "score": overlap + label_bonus + preferred_bonus})
     return sorted(fragments, key=lambda row: (-int(row["score"]), len(str(row["text"])), str(row["evidence_ref"])))
 
 
@@ -588,11 +590,15 @@ def build_extractive_cards(
     max_claims: int,
     max_cards: int,
     primary_evidence_type: str = "",
+    preferred_source_types: Iterable[str] | str | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    preferred = as_source_types(
+        preferred_source_types if preferred_source_types is not None else primary_evidence_type
+    )
     claims = _extractive_claims(question, max_claims)
     catalog = list(hierarchy.get("l0_catalog") or [])
     l1_by_anchor = {str(row.get("anchor_ref") or ""): row for row in hierarchy.get("l1_contexts") or []}
-    fragments = _rank_extractive_fragments(question, catalog, l1_by_anchor, primary_evidence_type)
+    fragments = _rank_extractive_fragments(question, catalog, l1_by_anchor, preferred)
     cards: list[dict[str, Any]] = []
     for index, fragment in enumerate(fragments[: max(1, max_cards)], start=1):
         ref = str(fragment["evidence_ref"])
@@ -738,9 +744,19 @@ def attach_cards(
     max_claims: int,
     max_cards: int,
     primary_evidence_type: str = "",
+    preferred_source_types: Iterable[str] | str | None = None,
     llm_result: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    fallback_cards, fallback_claims = build_extractive_cards(question, hierarchy, max_claims, max_cards, primary_evidence_type)
+    preferred = as_source_types(
+        preferred_source_types if preferred_source_types is not None else primary_evidence_type
+    )
+    fallback_cards, fallback_claims = build_extractive_cards(
+        question,
+        hierarchy,
+        max_claims,
+        max_cards,
+        preferred_source_types=preferred,
+    )
     rejected: list[dict[str, Any]] = []
     if mode == "verified_llm" and isinstance(llm_result, dict):
         cards, claims, rejected = verify_llm_cards(llm_result, hierarchy, max_claims, max_cards)
@@ -840,7 +856,7 @@ def hierarchy_prompt_projection(hierarchy: dict[str, Any], l1_max_chars: int = 4
     micro_text_chars = int(hierarchy.get("prompt_micro_text_chars") or 240)
     anchors = [record for record in catalog.values() if record.get("role") == "selected_anchor"]
     anchors.sort(key=lambda record: (int(record.get("selection_rank") or 10**8), _record_order(record)))
-    is_multi = "multi" in str(hierarchy.get("task_family") or "").lower()
+    is_multi = bool(hierarchy.get("task_is_multi")) or "multi" in str(hierarchy.get("task_family") or "").lower()
     query_terms = set(tokenize(" ".join(str(claim.get("claim") or "") for claim in hierarchy.get("query_claims") or [])))
     micro_order = str(hierarchy.get("keyed_micro_order") or hierarchy.get("micro_order") or "selection")
     query_aware_order = micro_order in {"query_aware", "stability_query_aware"}
@@ -853,7 +869,8 @@ def hierarchy_prompt_projection(hierarchy: dict[str, Any], l1_max_chars: int = 4
             return cached
         text = " ".join((str(record.get("label") or ""), str(record.get("text") or "")))
         overlap = len(query_terms.intersection(tokenize(text)))
-        primary_source = str(hierarchy.get("primary_evidence_type") or "")
+        preferred = tuple(as_source_types(hierarchy.get("preferred_source_types") or ()))
+        primary_source = preferred[0] if preferred else str(hierarchy.get("primary_evidence_type") or "")
         primary = int(str(record.get("source_type") or "") == primary_source)
         facts = min(3, len(_NUMBER_RE.findall(text)) + len(_ENTITY_RE.findall(text)))
         # A provenance union is an ensemble, not a fresh reranker score. When

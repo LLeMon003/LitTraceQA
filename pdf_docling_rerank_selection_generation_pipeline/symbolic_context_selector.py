@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 from pathlib import Path
 import re
-from typing import Any
+from typing import Any, Sequence
 
 from .metadata_index import BM25Okapi, tokenize
 from .evidence_packages import EvidencePackageConfig, build_packages, select_packages
@@ -18,6 +18,7 @@ from .symbolic_schema import (
     to_official_source_type,
 )
 from .source_type_hints import infer_source_type_hints
+from .task_structure import as_source_types
 
 
 SOURCE_TYPE_ORDER = {
@@ -92,7 +93,6 @@ def _object_mention(prefix: str, value: str) -> re.Pattern[str] | None:
 def _record_source_type_bonus(
     *,
     source_type: str,
-    primary_evidence_type: str | None,
     query: str,
     text: str,
     label: Any,
@@ -108,9 +108,6 @@ def _record_source_type_bonus(
 
     bonus = 0.0
     combined = " ".join([str(label or ""), text or ""])
-    primary = to_official_source_type(source_type=primary_evidence_type) or str(primary_evidence_type or "")
-    if source_type == primary:
-        bonus += 0.35
     if source_type == "table":
         table_pattern = _object_mention("Table", str(targets.get("table_id") or ""))
         if table_pattern and table_pattern.search(combined):
@@ -211,6 +208,8 @@ def project_context_for_vlm2(record: dict[str, Any], mode: str) -> dict[str, Any
         projected.pop("grounding_label", None)
     if record.get("source_type_hints"):
         projected["source_type_hints"] = record.get("source_type_hints")
+    if projected["source_type"] == "table" and isinstance(record.get("table_structure"), dict):
+        projected["table_structure"] = record.get("table_structure")
     if mode == "cropped_image" and record.get("image_ref"):
         projected["image_ref"] = record.get("image_ref")
     return projected
@@ -451,18 +450,28 @@ def _add_ranked(
 def _select_with_type_budgets(
     ranked: list[dict[str, Any]],
     total_budget: int,
-    primary_evidence_type: str | None,
+    preferred_source_types: Sequence[str],
     primary_min: int,
     support_text_min: int,
     context_types_enabled: bool,
     per_type_budget: int,
 ) -> list[dict[str, Any]]:
     total_budget = max(1, int(total_budget or 1))
-    primary = to_official_source_type(source_type=primary_evidence_type) or str(primary_evidence_type or "")
     selected: list[dict[str, Any]] = []
     seen: set[str] = set()
-    if primary in OFFICIAL_EVIDENCE_SOURCE_TYPES:
-        _add_ranked(selected, seen, [r for r in ranked if r.get("source_type") == primary], min(primary_min, total_budget))
+    preferred = tuple(as_source_types(preferred_source_types))
+    if preferred:
+        per_type_min = max(1, int(primary_min) // max(1, len(preferred)))
+        for source_type in preferred:
+            remaining = max(0, total_budget - len(selected))
+            if remaining <= 0:
+                break
+            _add_ranked(
+                selected,
+                seen,
+                [r for r in ranked if r.get("source_type") == source_type],
+                min(remaining, per_type_min),
+            )
     if len(selected) < total_budget:
         _add_ranked(selected, seen, [r for r in ranked if r.get("source_type") == "text_span"], min(total_budget, len(selected) + support_text_min))
     if context_types_enabled and len(selected) < total_budget:
@@ -618,9 +627,11 @@ def select_symbolic_contexts(
     candidate_records: list[dict[str, Any]],
     processed_root: str | Path,
     parser_model_slug: str,
+    source_hint_query: str | None = None,
     top_n_records: int = 24,
     top_n_visual_records: int = 6,
     primary_evidence_type: str | None = None,
+    preferred_source_types: Sequence[str] | None = None,
     query_id: str | None = None,
     vlm2_context_mode: str = "text_only",
     include_parse_confidence: bool = True,
@@ -652,8 +663,14 @@ def select_symbolic_contexts(
     evidence_package_rrf_k: int = 60,
     evidence_package_candidate_pool_per_route: int = 0,
     evidence_package_max_per_page: int = 2,
+    slot_plan: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    question = source_hint_query or query
     normalized_mode = str(context_selection_mode or "page_all_symbolic").strip().lower()
+    preferred = tuple(
+        as_source_types(preferred_source_types if preferred_source_types is not None else primary_evidence_type)
+    )
+    preferred_set = set(preferred)
     allow_header_footer = _query_needs_header_footer(query)
     valid = [
         r
@@ -697,10 +714,24 @@ def select_symbolic_contexts(
             config=score_config,
             top_k_sections=0,
             query_id=query_id,
-            primary_evidence_type=primary_evidence_type,
+            primary_evidence_type=preferred[0] if preferred else None,
             candidate_paper_metadata=candidate_paper_metadata,
         )
+        # Delayed to avoid the existing selector -> hierarchy -> slot module
+        # dependency cycle during import.
+        from .slot_generation import plan_package_routes, plan_paper_package_routes
+
+        slot_package_routes = plan_package_routes(slot_plan, question)
         route_queries: list[str] = []
+        slot_route_queries = [
+            (route["query"], tuple(route["record_types"]))
+            for route in slot_package_routes
+        ]
+        slot_paper_package_routes = plan_paper_package_routes(slot_plan, candidate_paper_metadata, question)
+        slot_paper_route_queries = [
+            (route["paper_id"], route["query"], tuple(route["record_types"]))
+            for route in slot_paper_package_routes
+        ]
         if paper_local_bm25_route_mode not in {"disabled", "original", "mask_method_aliases"}:
             raise ValueError("Unsupported PAPER_LOCAL_BM25_ROUTE_MODE.")
         paper_route_queries: list[tuple[str, str]] = []
@@ -713,7 +744,7 @@ def select_symbolic_contexts(
                 plan, warnings, cache_hit = generate_evidence_plan(
                     query_id=query_id,
                     query=query,
-                    primary_evidence_type=primary_evidence_type,
+                    primary_evidence_type=preferred[0] if preferred else None,
                     candidate_papers=candidate_paper_metadata or [],
                     config=paper_claim_config,
                     client=hyde_client,
@@ -766,10 +797,13 @@ def select_symbolic_contexts(
         )
         package_result = select_packages(
             query=query,
+            source_hint_query=question,
             packages=build_packages(valid, relevance["trace"], package_config),
-            primary_evidence_type=primary_evidence_type,
+            preferred_source_types=preferred,
             is_multi_paper_task=is_multi_paper_task,
             route_queries=route_queries,
+            slot_route_queries=slot_route_queries,
+            slot_paper_route_queries=slot_paper_route_queries,
             paper_route_queries=paper_route_queries,
             paper_local_route_queries=paper_local_route_queries,
             config=package_config,
@@ -777,6 +811,8 @@ def select_symbolic_contexts(
         relevance["trace"]["hyde"] = hyde_audit
         relevance["trace"]["paper_conditioned_claims"] = paper_claim_audit
         relevance["trace"]["paper_local_bm25_route"] = paper_local_bm25_audit
+        relevance["trace"]["slot_package_routes"] = slot_package_routes
+        relevance["trace"]["slot_paper_package_routes"] = slot_paper_package_routes
         relevance["trace"]["package_selection"] = package_result["trace"]
         processed = Path(processed_root)
         selected_records_internal: list[dict[str, Any]] = []
@@ -821,7 +857,7 @@ def select_symbolic_contexts(
             debug["selection_method"] = "evidence_package_coverage"
             selected_records_debug.append(debug)
         selected_evidence = [project_context_for_vlm2(record, vlm2_context_mode) for record in selected_records_internal]
-        primary_source = to_official_source_type(source_type=primary_evidence_type) or str(primary_evidence_type or "")
+        primary_source = preferred[0] if preferred else ""
         compact_chunk_packets = _compact_package_packets(package_result["packages"], selected_records_internal)
         prompt_audit = audit_selected_context(selected_evidence, compact_chunk_packets, attachments)
         distribution = dict(Counter(str(record.get("source_type")) for record in selected_evidence))
@@ -877,13 +913,16 @@ def select_symbolic_contexts(
             "selected_records": selected_records_debug,
             "selected_visual_records": visual_records[:top_n_visual_records],
             "source_type_distribution": distribution,
-            "primary_evidence_type_count": sum(record.get("source_type") == primary_source for record in selected_evidence),
-            "supporting_evidence_count": max(0, len(selected_evidence) - sum(record.get("source_type") == primary_source for record in selected_evidence)),
+            "primary_evidence_type_count": sum(record.get("source_type") in preferred_set for record in selected_evidence),
+            "supporting_evidence_count": max(0, len(selected_evidence) - sum(record.get("source_type") in preferred_set for record in selected_evidence)),
             "grounding_label_hints_by_type": dict(Counter(str((record.get("grounding_label") or {}).get("type")) for record in selected_evidence if record.get("grounding_label"))),
             "context_selection_mode": normalized_mode,
             "context_truncated": False,
             "selected_record_count": len(selected_evidence),
             "selected_context_groups": selected_section_summary,
+            "targeted_candidate_paper_ids": list(dict.fromkeys(
+                route["paper_id"] for route in slot_paper_package_routes
+            )),
             "section_relevance_trace": relevance["trace"],
         }
     query_tokens = tokenize(query)
@@ -902,7 +941,10 @@ def select_symbolic_contexts(
     ]
     bm25 = BM25Okapi(corpus)
     scores = bm25.get_scores(query_tokens) if query_tokens else [0.0] * len(valid)
-    boosts = TYPE_BOOSTS.get(primary_evidence_type or "", {})
+    boosts: dict[str, float] = {}
+    for source_type in preferred:
+        for record_type, boost in TYPE_BOOSTS.get(source_type, {}).items():
+            boosts[record_type] = boosts.get(record_type, 0.0) + float(boost)
     targets = _question_targets(query)
     processed = Path(processed_root)
     ranked: list[dict[str, Any]] = []
@@ -913,7 +955,6 @@ def select_symbolic_contexts(
         text = str(record.get("text") or "")
         source_bonus = _record_source_type_bonus(
             source_type=source_type,
-            primary_evidence_type=primary_evidence_type,
             query=query,
             text=text,
             label=record.get("label"),
@@ -936,9 +977,10 @@ def select_symbolic_contexts(
             score -= 0.5
         if record_type in HEADER_FOOTER_RECORD_TYPES:
             score -= 0.75
-        if record_type == "citation_context" and primary_evidence_type != "citation_context":
+        penalize_citation = bool(preferred) and "citation_context" not in preferred
+        if record_type == "citation_context" and penalize_citation:
             score -= 1.0
-        if len(str(record.get("text") or "")) > 2500 and record_type == "citation_context" and primary_evidence_type != "citation_context":
+        if len(str(record.get("text") or "")) > 2500 and record_type == "citation_context" and penalize_citation:
             score -= 0.75
         selected = {
             "paper_id": record.get("paper_id"),
@@ -982,7 +1024,7 @@ def select_symbolic_contexts(
         anchors = _select_with_type_budgets(
             ranked,
             anchor_budget,
-            primary_evidence_type,
+            preferred,
             primary_evidence_min,
             support_text_min,
             context_types_enabled,
@@ -1004,7 +1046,7 @@ def select_symbolic_contexts(
         selected_records_internal = _select_with_type_budgets(
             ranked,
             evidence_total_budget or top_n_records,
-            primary_evidence_type,
+            preferred,
             primary_evidence_min,
             support_text_min,
             context_types_enabled,
@@ -1039,8 +1081,7 @@ def select_symbolic_contexts(
     distribution = dict(Counter(str(r.get("source_type")) for r in selected_evidence if isinstance(r, dict)))
     for source_type in OFFICIAL_EVIDENCE_SOURCE_TYPES:
         distribution.setdefault(source_type, 0)
-    primary_source = to_official_source_type(source_type=primary_evidence_type) or str(primary_evidence_type or "")
-    primary_count = sum(1 for r in selected_evidence if r.get("source_type") == primary_source)
+    primary_count = sum(1 for r in selected_evidence if r.get("source_type") in preferred_set)
     grounding_label_hints_by_type = dict(
         Counter(
             str((r.get("grounding_label") or {}).get("type"))

@@ -13,8 +13,8 @@ from typing import Any
 
 from .config import load_pipeline_config
 from .data_io import append_jsonl, append_jsonl_rows, extract_answer_contract, find_official_file, read_jsonl, write_jsonl
-from .metadata_index import build_metadata_records, retrieve_candidates
-from .metadata_selection import empty_metadata_prediction
+from .metadata_index import build_metadata_records, retrieve_candidates, tokenize
+from .metadata_selection import empty_answer_for_sample
 from .multi_paper_hyde import MultiPaperHyDEConfig
 from .paper_conditioned_claims import PaperConditionedClaimsConfig
 from .openreview_filter import filter_openreview_metadata
@@ -23,6 +23,12 @@ from .pdf_cache import ensure_candidate_pdfs, write_pdf_availability
 from .pdf_extraction_parser import ARTIFACT_VERSION, extract_pdf_symbolic_records_with_backend
 from .symbolic_context_selector import select_symbolic_contexts
 from .section_relevance import SectionRelevanceConfig
+from .slot_generation import (
+    plan_augmented_rerank_query,
+    slot_plan_messages,
+    validate_slot_plan,
+)
+from .task_structure import derive_task_structure
 from .transcription_backends import BACKEND_CHOICES, normalize_backend_name
 from .vlm_answer_client import VLMAnswerClient
 from .vlm_answer_prompt_builder import build_symbolic_answer_prompt
@@ -32,9 +38,14 @@ BASELINE_TYPE = "pdf_docling_rerank_selection_generation"
 DEFAULT_TRANSCRIPTION_BACKEND = "docling"
 
 
-def parse_args() -> argparse.Namespace:
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Parser-first PDF extraction symbolic VLM LitTraceQA baseline.")
     p.add_argument("--official-dir", default="official_dev")
+    p.add_argument(
+        "--inputs",
+        default="",
+        help="Input JSONL to run (e.g. official_dev/data/test.jsonl or test_extra.jsonl). Defaults to official validation_inputs.jsonl.",
+    )
     p.add_argument("--output-dir", default="outputs/pdf_docling_rerank_selection_generation_pipeline")
     p.add_argument("--pdf-output-dir", default="raw_pdfs")
     p.add_argument("--processed-output-dir", default="processed_pdfs/pdf_docling_rerank_selection_generation_pipeline")
@@ -82,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--show-progress", action="store_true")
     p.add_argument("--vlm2-context-mode", choices=["text_only", "cropped_image"], default=None)
     p.add_argument("--transcription-backend", choices=BACKEND_CHOICES, default=None)
-    return p.parse_args()
+    return p.parse_args(argv)
 
 
 def _split_query_ids(raw: str) -> set[str]:
@@ -101,8 +112,9 @@ def _paths(output_dir: Path, resume: bool) -> dict[str, Path]:
         "symbolic_records_debug": "symbolic_records.debug.jsonl",
         "selected_contexts_debug": "selected_symbolic_contexts.debug.jsonl",
         "selected_contexts_prompt": "selected_symbolic_contexts.prompt.jsonl",
-        "section_relevance_trace": "section_relevance.trace.jsonl",
-        "raw_answer": "raw_vlm_answer_responses.jsonl",
+"section_relevance_trace": "section_relevance.trace.jsonl",
+"slot_plans": "slot_plans.jsonl",
+"raw_answer": "raw_vlm_answer_responses.jsonl",
         "prompt_previews": "prompt_previews.jsonl",
         "errors": "errors.jsonl",
         "report": "run_report.md",
@@ -148,6 +160,15 @@ def _load_reused_candidates(path: str | Path) -> dict[str, list[dict[str, Any]]]
     if not grouped:
         raise ValueError(f"candidate papers input contains no flat candidate rows: {source}")
     return grouped
+
+
+def _load_slot_plans(path: Path) -> dict[str, dict[str, Any]]:
+    """Reuse the latest validated plan when a run is resumed."""
+    return {
+        str(row["query_id"]): row["plan"]
+        for row in _read_jsonl_if_exists(path)
+        if row.get("query_id") and isinstance(row.get("plan"), dict)
+    }
 
 
 def _acquire_output_lock(output_dir: Path) -> Any:
@@ -198,10 +219,6 @@ def _remove_query_rows(paths: dict[str, Path], query_ids: set[str], show_progres
             temp_path.unlink(missing_ok=True)
 
 
-def _empty_answer_for_sample(sample: dict[str, Any]) -> dict[str, Any]:
-    return empty_metadata_prediction(sample).get("answer", {})
-
-
 def _count_jsonl(path: Path) -> int:
     if not path.exists():
         return 0
@@ -240,7 +257,13 @@ def _source_dist_add(target: dict[str, int], source: dict[str, Any]) -> None:
         target[str(key)] = int(target.get(str(key), 0)) + int(value or 0)
 
 
-def _messages_for_json_retry(messages: list[dict[str, Any]], evidence_limit: int) -> list[dict[str, Any]]:
+def _messages_for_json_retry(
+    messages: list[dict[str, Any]],
+    evidence_limit: int,
+    *,
+    require_table_rows: bool = False,
+    allow_partial_table_rows: bool = False,
+) -> list[dict[str, Any]]:
     retried = [dict(message) for message in messages]
     for message in reversed(retried):
         if message.get("role") != "user":
@@ -250,9 +273,53 @@ def _messages_for_json_retry(messages: list[dict[str, Any]], evidence_limit: int
             + "\n\nRETRY REQUIREMENT: Return one complete valid JSON object only. "
             + f"Use at most {evidence_limit} directly supporting evidence_ref items. "
             + "Do not enumerate all selected records and do not include reasoning or markdown."
+            + (
+                " This is a table question: when supplied evidence directly supports a value, return at least one non-empty table_answer_plan row with the exact schema columns and mirror it in answer.table.rows."
+                if require_table_rows
+                else ""
+            )
+            + (
+                " Score every requested row independently. Do not return an empty table merely because another requested value is unsupported; emit every directly supported row and omit only rows without direct support."
+                if allow_partial_table_rows
+                else ""
+            )
         )
         break
     return retried
+
+
+def _table_focused_context(selected: dict[str, Any], question: str, limit: int = 12) -> dict[str, Any]:
+    """Retry an empty table answer with the most question-bearing records only."""
+    terms = {term for term in tokenize(question) if len(term) >= 3}
+    records = [row for row in selected.get("selected_evidence", []) if isinstance(row, dict)]
+    targeted_ids = {
+        str(paper_id) for paper_id in selected.get("targeted_candidate_paper_ids") or []
+        if str(paper_id)
+    }
+    if len(targeted_ids) >= 2:
+        records = [row for row in records if str(row.get("paper_id") or "") in targeted_ids]
+    deduped: dict[str, dict[str, Any]] = {}
+    for index, row in enumerate(records):
+        key = str(row.get("global_record_id") or row.get("evidence_ref") or index)
+        deduped.setdefault(key, row)
+
+    def score(row: dict[str, Any]) -> tuple[int, int]:
+        text = " ".join(str(row.get(key) or "") for key in ("label", "text"))
+        return len(terms.intersection(tokenize(text))), int(str(row.get("source_type") or "") == "table")
+
+    focused = dict(selected)
+    focused["selected_evidence"] = sorted(deduped.values(), key=score, reverse=True)[:max(1, limit)]
+    focused["compact_chunk_packets"] = []
+    focused.pop("evidence_ledger", None)
+    focused.pop("evidence_hierarchy", None)
+    return focused
+
+
+def _has_required_table_rows(prediction: dict[str, Any], sample: dict[str, Any]) -> bool:
+    if "table" not in (sample.get("answer_types") or []):
+        return True
+    table = (prediction.get("answer") or {}).get("table")
+    return isinstance(table, dict) and isinstance(table.get("rows"), list) and bool(table["rows"])
 
 
 def _format_seconds(seconds: float) -> str:
@@ -330,24 +397,17 @@ def _project_runtime_record(record: dict[str, Any]) -> dict[str, Any]:
     return {key: record.get(key) for key in keys}
 
 
-def _primary_type(sample: dict[str, Any]) -> str:
-    return str(sample.get("primary_evidence_type") or sample.get("evidence_type") or "text_span")
-
-
-def _is_multi_paper_task(sample: dict[str, Any]) -> bool:
-    task_family = str(sample.get("task_family") or "").lower()
-    if "multi" in task_family:
-        return True
-    question = str(sample.get("question") or "").lower()
-    return any(term in question for term in ["across papers", "across all papers", "which papers", "each paper", "among the papers"])
-
-
-def _top_k_for_sample(sample: dict[str, Any], config: Any, cli_top_k: int | None) -> int:
+def _top_k_for_sample(
+    sample: dict[str, Any],
+    config: Any,
+    cli_top_k: int | None,
+    slot_plan: dict[str, Any] | None = None,
+) -> int:
     if cli_top_k is not None:
         return max(1, int(cli_top_k))
     if not config.task_family_budget_enabled:
         return max(1, int(config.single_paper_top_k_papers))
-    if _is_multi_paper_task(sample):
+    if derive_task_structure(sample, slot_plan).is_multi_paper:
         return max(1, int(config.multi_paper_top_k_papers))
     return max(1, int(config.single_paper_top_k_papers))
 
@@ -371,10 +431,17 @@ def main() -> int:
     if args.replace_query_results:
         _remove_query_rows(paths, only_ids, args.show_progress)
     completed_query_ids = _completed_query_ids(paths["predictions"]) if args.resume else set()
+    reused_slot_plans = _load_slot_plans(paths["slot_plans"]) if args.resume else {}
     processed_root = Path(args.processed_output_dir)
     structured_root = processed_root / transcription_backend
-    inputs = read_jsonl(find_official_file(args.official_dir, "validation_inputs.jsonl"))
-    validation_rows = read_jsonl(find_official_file(args.official_dir, "validation.jsonl"))
+    inputs_path = Path(args.inputs) if args.inputs else find_official_file(args.official_dir, "validation_inputs.jsonl")
+    inputs = read_jsonl(inputs_path)
+    try:
+        validation_rows = read_jsonl(find_official_file(args.official_dir, "validation.jsonl"))
+    except FileNotFoundError:
+        # test/test_extra have no gold file; the answer contract is built from
+        # the inference-visible fields (multiple_choice_options/table_schema).
+        validation_rows = []
     validation_by_id = {str(row.get("query_id") or ""): row for row in validation_rows if row.get("query_id")}
     if only_ids:
         inputs = [row for row in inputs if str(row.get("query_id") or "") in only_ids]
@@ -456,15 +523,29 @@ def main() -> int:
                 )
                 continue
             answer_contract = extract_answer_contract(sample, validation_by_id.get(query_id))
-            top_k_papers = _top_k_for_sample(sample, config, args.top_k_papers)
-            task_family = str(sample.get("task_family") or "")
-            is_multi_paper = _is_multi_paper_task(sample)
+            # Plan from query and answer contract only, then freeze it. Slots
+            # drive task routing and package selection, never candidate papers.
+            slot_plan = reused_slot_plans.get(query_id)
+            if slot_plan is None:
+                try:
+                    raw_plan_result = answer_client.generate_prediction(
+                        slot_plan_messages(sample, answer_contract)
+                    )
+                    raw_plan = extract_json_object(str(raw_plan_result["content"]))
+                    slot_plan, plan_audit = validate_slot_plan(raw_plan, sample)
+                    append_jsonl(paths["slot_plans"], {"query_id": query_id, "plan": slot_plan, "audit": plan_audit})
+                except Exception as exc:
+                    append_jsonl(paths["errors"], {"query_id": query_id, "type": "slot_plan_generation_failed", "error": str(exc)})
+            task_structure = derive_task_structure(sample, slot_plan)
+            top_k_papers = _top_k_for_sample(sample, config, args.top_k_papers, slot_plan)
+            task_family = task_structure.task_family
+            is_multi_paper = task_structure.is_multi_paper
             query_decomposition_enabled = bool(config.retrieval_enable_query_decomposition and is_multi_paper)
             query_label = f"query {query_index}/{total_queries} {query_id}"
             _progress(
                 args.show_progress,
                 f"{_progress_bar(query_index - 1, total_queries)} {query_label} start "
-                f"task_family={task_family or '-'} primary={_primary_type(sample)} "
+                f"task_family={task_family or '-'} preferred={','.join(task_structure.preferred_source_types) or '-'} "
                 f"top_k_papers={top_k_papers} query_decomposition={query_decomposition_enabled}",
             )
             if reused_candidates_by_query:
@@ -619,13 +700,14 @@ def main() -> int:
                 )
                 continue
             selected = select_symbolic_contexts(
-                question,
+                plan_augmented_rerank_query(slot_plan, question) if slot_plan else question,
                 candidate_records,
+                source_hint_query=question,
                 processed_root=processed_root,
                 parser_model_slug=transcription_backend,
                 top_n_records=args.top_n_records,
                 top_n_visual_records=args.top_n_visual_records,
-                primary_evidence_type=_primary_type(sample),
+                preferred_source_types=task_structure.preferred_source_types,
                 query_id=query_id,
                 vlm2_context_mode=context_mode,
                 include_parse_confidence=False,
@@ -693,6 +775,7 @@ def main() -> int:
                 evidence_package_candidate_pool_per_route=config.evidence_package_candidate_pool_per_route,
                 evidence_package_max_per_page=config.evidence_package_max_per_page,
                 evidence_package_page_text_anchors_per_page=config.evidence_package_page_text_anchors_per_page,
+                slot_plan=slot_plan,
             )
             selected_debug = {
                 "query_id": query_id,
@@ -737,11 +820,21 @@ def main() -> int:
                 f"truncated={bool(selected.get('context_truncated'))} "
                 f"source_types={_source_dist_text(selected.get('source_type_distribution') or {})}",
             )
-            messages = build_symbolic_answer_prompt(sample, candidates, selected, answer_client.supports_image_input(), transcription_backend, config.answer_model, answer_contract)
+            messages = build_symbolic_answer_prompt(
+                sample,
+                candidates,
+                selected,
+                answer_client.supports_image_input(),
+                transcription_backend,
+                config.answer_model,
+                answer_contract,
+                multi_paper_task=is_multi_paper,
+                preferred_source_types=task_structure.preferred_source_types,
+            )
             append_jsonl(paths["prompt_previews"], {"query_id": query_id, "baseline_type": BASELINE_TYPE, "messages": messages})
             if args.dry_run or args.skip_generation:
                 fallback = make_fallback_prediction(sample, candidates[0] if candidates else None)
-                fallback["answer"] = _empty_answer_for_sample(sample)
+                fallback["answer"] = empty_answer_for_sample(sample)
                 append_jsonl(paths["predictions"], fallback)
                 stats["fallback_predictions"] += 1
                 _write_report(paths["report"], stats, paths)
@@ -797,11 +890,33 @@ def main() -> int:
                         )
                         if not validate_prediction_shape(prediction):
                             raise ValueError("invalid prediction shape")
+                        if not _has_required_table_rows(prediction, sample):
+                            raise ValueError("empty_table_rows")
                         break
                     except (ValueError, KeyError, TypeError, json.JSONDecodeError):
                         if generation_attempt > parse_retries:
                             raise
-                        generation_messages = _messages_for_json_retry(messages, evidence_limit)
+                        retry_messages = messages
+                        if "table" in (sample.get("answer_types") or []):
+                            retry_messages = build_symbolic_answer_prompt(
+                                sample,
+                                candidates,
+                                _table_focused_context(selected, question),
+                                answer_client.supports_image_input(),
+                                transcription_backend,
+                                config.answer_model,
+                                answer_contract,
+                                multi_paper_task=is_multi_paper,
+                                preferred_source_types=task_structure.preferred_source_types,
+                            )
+                        generation_messages = _messages_for_json_retry(
+                            retry_messages,
+                            evidence_limit,
+                            require_table_rows="table" in (sample.get("answer_types") or []),
+                            allow_partial_table_rows=(
+                                "table" in (sample.get("answer_types") or []) and generation_attempt >= 2
+                            ),
+                        )
                 append_jsonl(paths["internal_predictions"], internal)
                 for error in errors:
                     append_jsonl(paths["errors"], error)

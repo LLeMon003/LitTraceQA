@@ -1,0 +1,17 @@
+{
+  "schema_version": 1,
+  "profile": "V2.3_RAW_FRESH_ZERO_RUNTIME_CACHE",
+  "purpose": "Hash-lock the immutable external inputs required before a fresh API generation. This manifest excludes historical generation caches, official gold, evaluator outputs, raw responses, and credentials.",
+  "reproduction_claim": "A successful run is a new fresh-generation experiment. It is not a claim that the historical cache-exact score or prediction SHA will recur.",
+  "assets": [
+    {"role": "version2_fresh_runner", "root": "release_root", "relative_path": "run_full_validation.py", "bytes": 14383, "sha256": "CE34FFEF9938ECF49BA64E82C1300C45C098BB624724808783A83F8FB832E989"},
+    {"role": "validation_inputs", "root": "release_root", "relative_path": "inputs/validation_inputs.jsonl", "bytes": 17885, "sha256": "8A16713478FACB0D54D28B4959A02B37FE584B8665AEEF245083A8329BFAC858"},
+    {"role": "paper_metadata", "root": "release_root", "relative_path": "inputs/paper_metadata.jsonl", "bytes": 47492750, "sha256": "A690D25D34C9BE08A7377CA8A87CEEB96D199A490E1F958DC35D118BBCE5478C"},
+    {"role": "option_inputs", "root": "release_root", "relative_path": "inputs_with_options/validation_inputs_with_options.jsonl", "bytes": 24205, "sha256": "322078587C34F2283B10229CCB20CC897890825C21F0515DB9872D94504B2F81"},
+    {"role": "docling_object_index", "root": "release_root", "relative_path": "artifacts/document_object_index_full_docling.jsonl", "bytes": 212801206, "sha256": "D488354DCB102740BDB1C6798063D144078E7AB59B910529DC22C1E5D41257B1"},
+    {"role": "sentence_index", "root": "release_root", "relative_path": "artifacts/sentence_index.jsonl", "bytes": 36631954, "sha256": "41DB88F7ACDFF3890E5EC665F90F8E8E225F182ADD0E9EE682AE6F1A3F01C793"},
+    {"role": "production_evidence_parent", "root": "release_root", "relative_path": "checkpoints/PRODUCTION_OPTION_AWARE_predictions.jsonl", "bytes": 25301, "sha256": "944513E5084522C3233842B9AE15DCD7BB2CEE1E44DC683DC827C8968FEDBBDE"},
+    {"role": "option_aware_replay", "root": "source_root", "relative_path": "scripts/replay_option_aware_multiple_choice.py", "bytes": 17524, "sha256": "6D1A64515AD8A0C94E398658DD484839B5617C7CAC46BD6B45038E2CA2EA3F53"},
+    {"role": "option_aware_object_index", "root": "source_root", "relative_path": "outputs/document_object_index.jsonl", "bytes": 31990843, "sha256": "222C63DEDBBC40FE6A441D6EDD76B996812D777DA9C214E4724192BA1CEE9DE6"}
+  ]
+}

@@ -14,16 +14,19 @@ from typing import Any, Iterable
 from .evidence_hierarchy import keyed_hierarchy_prompt_projection
 from .metadata_index import tokenize
 from .symbolic_schema import OFFICIAL_EVIDENCE_SOURCE_TYPES, to_official_source_type
+from .table_structure import match_schema_column, remap_row_values
+from .task_structure import derive_task_structure, explicit_source_type_mentions
 
 
-SLOT_PLAN_VERSION = "v1_qwen_slot_contract"
+SLOT_PLAN_VERSION = "v3_slot_evidence_routing"
 _ROLES = {"direct_answer", "condition", "contributor"}
 _OPERATIONS = {"direct", "difference", "maximum", "minimum", "count", "list"}
-_OPERATION_ALIASES = {"literal_extraction": "direct", "extract": "direct", "comparison": "difference"}
+_OPERATION_ALIASES = {"literal": "direct", "literal_extraction": "direct", "extract": "direct", "comparison": "difference"}
 _SOURCE_TYPE_ALIASES = {"text": "text_span", "paragraph": "text_span", "citation": "citation_context", "equation": "equation_algorithm", "algorithm": "equation_algorithm"}
 _STATUSES = {"supported", "partial", "unsupported", "conflict", "unreadable"}
 _FOCUS_STOPWORDS = {"a", "an", "and", "are", "as", "by", "does", "do", "for", "from", "has", "have", "in", "is", "it", "kind", "of", "on", "the", "to", "under", "used", "use", "was", "were", "what", "which", "who", "with"}
 _TITLE_ROUTING_STOPWORDS = _FOCUS_STOPWORDS | {"algorithm", "author", "citation", "cited", "equation", "figure", "first", "framework", "method", "model", "paper", "performance", "reference", "result", "score", "table"}
+_INITIALISM_PREFIX_WORDS = {"benchmark", "dataset", "distillation", "framework", "method", "model", "paper"}
 _CONDITION_STOPWORDS = _FOCUS_STOPWORDS | {
     "average", "benchmark", "compression", "condition", "configuration", "dataset", "metric",
     "percentage", "performance", "rate", "ratio", "result", "results", "score", "scores", "setting", "value",
@@ -108,16 +111,23 @@ def _fallback_operation(question: Any) -> str:
 
 
 def _default_plan(sample: dict[str, Any]) -> dict[str, Any]:
-    primary = to_official_source_type(source_type=sample.get("primary_evidence_type"))
+    structure = derive_task_structure(sample)
+    source_types = list(structure.preferred_source_types)
+    focus = _fallback_focus(sample.get("question"))
     return {
         "version": SLOT_PLAN_VERSION,
         "slots": [{
             "id": "S001", "role": "direct_answer", "operation": _fallback_operation(sample.get("question")),
-            "paper_scope": [], "required_source_types": [primary] if primary else [],
-            "entities": _fallback_focus(sample.get("question")), "required_conditions": [],
+            "required_source_types": source_types,
+            "entities": focus, "required_conditions": [],
         }],
-        "relations": [],
-        "requires_cross_paper_synthesis": "multi" in str(sample.get("task_family") or "").lower(),
+        "requires_cross_paper_synthesis": structure.is_multi_paper,
+        "query_analysis": {
+            "entities": focus,
+            "comparison_targets": [],
+            "inferred_paper_count": 2 if structure.is_multi_paper else 1,
+            "cross_paper_synthesis_required": structure.is_multi_paper,
+        },
         "fallback": True,
     }
 
@@ -151,25 +161,260 @@ def _paper_identity_conditions(conditions: list[str], candidates: list[dict[str,
 def slot_plan_messages(sample: dict[str, Any], contract: dict[str, Any]) -> list[dict[str, str]]:
     """Ask Qwen to decompose the public query/contract, not paper metadata."""
     payload = {
-        "question": sample.get("question"), "task_family": sample.get("task_family"),
-        "primary_evidence_type": sample.get("primary_evidence_type"), "answer_contract": contract,
+        "question": sample.get("question"),
+        "answer_contract": contract,
     }
     system = (
         "Plan evidence requirements, not an answer. Do not infer facts, values, pages, locators, paper identities, or relevance. "
-        "Split only independently verifiable answer requirements. You MUST return at least one slot. Return JSON only."
+        "For a cross-paper list, make one slot per named entity; otherwise split only independently verifiable answer requirements. You MUST return at least one slot. Return JSON only."
         " required_conditions must be measurable evidence conditions (dataset, metric, setting, configuration); "
         "never use a paper name, paper identity, or title as a condition."
+        " query_analysis is a semantic reading of the question only: entities are the named methods/models/datasets/"
+        "frameworks in the question; comparison_targets are the distinct things being compared (same list as entities "
+        "when the question compares them); inferred_paper_count is the number of distinct papers the evidence must "
+        "come from when the question implies it, otherwise null; cross_paper_synthesis_required is true only when the "
+        "answer can only be produced by combining evidence from multiple papers."
     )
     user = (
         "Use literal values from this schema: role is direct_answer|condition|contributor; operation is direct|difference|maximum|minimum|count|list; "
-        "required_source_types use text_span|table|figure|equation_algorithm|citation_context. Never return an empty slots array. Example: "
+        "required_source_types use text_span|table|figure|equation_algorithm|citation_context. Never return an empty slots array. Return the full object "
+        "including query_analysis. Do not return paper_scope or relations; they are not part of the contract. Example: "
         "{\"slots\":[{\"id\":\"S001\",\"role\":\"direct_answer\",\"operation\":\"difference\","
         "\"required_source_types\":[\"table\"],\"entities\":[\"Method A\",\"Method B\"],"
-        "\"required_conditions\":[\"F1\",\"Dataset X\"]}],\"relations\":[\"compare\"],"
-        "\"requires_cross_paper_synthesis\":false}.\nINPUT:"
+        "\"required_conditions\":[\"F1\",\"Dataset X\"]}],"
+        "\"requires_cross_paper_synthesis\":true,"
+        "\"query_analysis\":{\"entities\":[\"Method A\",\"Method B\"],"
+        "\"comparison_targets\":[\"Method A\",\"Method B\"],\"inferred_paper_count\":2,"
+        "\"cross_paper_synthesis_required\":true}}.\nINPUT:"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def plan_package_routes(plan: dict[str, Any] | None, question: str) -> list[dict[str, Any]]:
+    """Build one lexical package route per slot, with its source-type constraint.
+
+    Candidate-paper retrieval intentionally does not call this function.  The
+    routes operate only after the single global Qwen score is frozen.
+    """
+    routes: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for slot in (plan or {}).get("slots") or []:
+        if not isinstance(slot, dict):
+            continue
+        source_types = [
+            to_official_source_type(source_type=value)
+            for value in slot.get("required_source_types") or []
+        ]
+        source_types = [value for value in source_types if value in OFFICIAL_EVIDENCE_SOURCE_TYPES]
+        route_types = [*source_types, *( ["text_span"] if "citation_context" in source_types else [])]
+        conditions = [str(value).strip() for value in slot.get("required_conditions") or [] if str(value).strip()]
+        terms = [
+            *source_types,
+            *[str(value).strip() for value in slot.get("entities") or []],
+            *conditions,
+        ]
+        route_query = re.sub(r"\s+", " ", " ".join(value for value in terms if value)).strip()
+        if not route_query:
+            route_query = re.sub(r"\s+", " ", str(question or "")).strip()
+        entity_keys = {
+            re.sub(r"[^a-z0-9]+", "", re.sub(r"\s*\([^()]*\)\s*$", "", str(value)).lower())
+            for value in slot.get("entities") or []
+        }
+        qualified_queries = [
+            re.sub(r"\s+", " ", " ".join([*source_types, match.group(1), match.group(2)])).strip()
+            for match in re.finditer(r"\b([A-Za-z][A-Za-z0-9-]{2,})\s*\(([^()]{3,80})\)", question)
+            if re.sub(r"[^a-z0-9]+", "", match.group(1).lower()) in entity_keys
+        ]
+        # A long literal condition list for one table target is a precise
+        # catalog lookup (for example, one row across six named datasets),
+        # not a generic table request.  Let it see unscored same-type records
+        # after Qwen once.
+        entities = [str(value).strip() for value in slot.get("entities") or [] if str(value).strip()]
+        is_table = len(source_types) == 1 and source_types[0] == "table"
+        enumerated_table_lookup = is_table and len(entities) == 1 and len(conditions) >= 4
+        for query, catalog_fallback in [(route_query, enumerated_table_lookup), *((query, True) for query in qualified_queries)]:
+            if len(query) < 4 or query in seen:
+                continue
+            seen.add(query)
+            route = {
+                "slot_id": str(slot.get("id") or f"S{len(routes) + 1:03d}"),
+                "record_types": route_types,
+                "query": query,
+            }
+            if catalog_fallback:
+                route["catalog_fallback"] = True
+            routes.append(route)
+    return routes
+
+
+def plan_paper_package_routes(
+    plan: dict[str, Any] | None,
+    candidates: list[dict[str, Any]] | None,
+    question: str = "",
+) -> list[dict[str, Any]]:
+    """Bind a slot only to a unique, title-supported candidate paper.
+
+    The planner never sees candidate metadata, so this is deterministic post-plan
+    routing rather than a predicted paper scope. Exact title phrases win;
+    a unique exact method name in the candidate abstract is the secondary
+    identity signal when the method is not in its paper title;
+    otherwise an explicit uppercase acronym plus at least one descriptive title
+    token must identify one candidate uniquely. A single venue/year explicitly
+    stated in the question is also a safe candidate filter for ambiguous title
+    acronyms. This admits references such as
+    "BRIDGE multi-view clustering paper" without treating generic descriptions
+    as paper identities.
+    """
+    routes: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, tuple[str, ...]]] = set()
+    title_rows = [
+        (
+            str(row.get("paper_id") or ""),
+            re.sub(r"[^a-z0-9]+", "", str(row.get("title") or "").lower()),
+            {term for term in tokenize(str(row.get("title") or "")) if len(term) >= 4 and term not in _TITLE_ROUTING_STOPWORDS},
+            str(row.get("abstract") or ""),
+            str(row.get("title") or ""),
+        )
+        for row in candidates or []
+        if isinstance(row, dict)
+    ]
+
+    def title_initialism(title: str) -> str:
+        return "".join(word[0] for word in re.findall(r"[A-Za-z0-9]+", title) if word and word.lower() not in _TITLE_ROUTING_STOPWORDS).lower()
+
+    def title_contains_initialism(title: str, entity: str) -> bool:
+        words = [word.lower() for word in re.findall(r"[A-Za-z0-9]+", title) if word.lower() not in _TITLE_ROUTING_STOPWORDS]
+        length = len(entity)
+        return any(
+            "".join(word[0] for word in words[start:start + length]) == entity
+            and all(word in _INITIALISM_PREFIX_WORDS for word in words[:start])
+            for start in range(max(0, len(words) - length + 1))
+        )
+
+    for slot in (plan or {}).get("slots") or []:
+        if not isinstance(slot, dict):
+            continue
+        source_types = [
+            to_official_source_type(source_type=value)
+            for value in slot.get("required_source_types") or []
+        ]
+        source_types = [value for value in source_types if value in OFFICIAL_EVIDENCE_SOURCE_TYPES]
+        route_types = [*source_types, *( ["text_span"] if "citation_context" in source_types else [])]
+        conditions = [str(value).strip() for value in slot.get("required_conditions") or []]
+        venue = re.search(r"\b(iccv|cvpr|acl|naacl|emnlp|neurips|iclr|icml)\s*(20\d{2})\b", " ".join(conditions), re.IGNORECASE)
+        if venue is None:
+            question_venues = {
+                (match.group(1).lower(), match.group(2))
+                for match in re.finditer(
+                    r"\b(iccv|cvpr|acl|naacl|emnlp|neurips|iclr|icml)\s*(20\d{2})\b",
+                    question,
+                    re.IGNORECASE,
+                )
+            }
+            if len(question_venues) == 1:
+                venue_name, venue_year = next(iter(question_venues))
+                venue = re.match(r"([a-z]+)(20\d{2})", venue_name + venue_year, re.IGNORECASE)
+        eligible = [
+            row for row in title_rows
+            if not venue or row[0].lower().startswith(f"{venue.group(1).lower()}{venue.group(2)}")
+        ]
+        for entity in (str(value).strip() for value in slot.get("entities") or []):
+            normalized_entity = re.sub(r"[^a-z0-9]+", "", entity.lower())
+            short_acronym = entity.isupper() and 3 <= len(normalized_entity) <= 5
+            short_title_matches = [
+                paper_id for paper_id, _title, _terms, _abstract, raw_title in eligible
+                if paper_id and re.match(rf"\s*{re.escape(entity)}\s*:", raw_title)
+            ]
+            if len(normalized_entity) < 5 and not short_acronym:
+                if len(short_title_matches) != 1:
+                    continue
+                matches = short_title_matches
+            elif short_acronym:
+                matches = [
+                    paper_id for paper_id, _title, _terms, _abstract, raw_title in eligible
+                    if paper_id and re.search(rf"(?<!\w){re.escape(entity)}(?!\w)", raw_title, re.IGNORECASE)
+                ]
+            else:
+                matches = [paper_id for paper_id, title, _terms, _abstract, _raw_title in eligible if paper_id and normalized_entity in title]
+            if len(matches) != 1 and short_acronym:
+                matches = [
+                    paper_id for paper_id, _title, _terms, _abstract, raw_title in eligible
+                    if paper_id and title_initialism(raw_title) == normalized_entity
+                ]
+            if len(matches) != 1 and short_acronym:
+                matches = [
+                    paper_id for paper_id, _title, _terms, _abstract, raw_title in eligible
+                    if paper_id and title_contains_initialism(raw_title, normalized_entity)
+                ]
+            if len(matches) != 1:
+                abstract_matches = [
+                    paper_id for paper_id, _title, _terms, abstract, _raw_title in eligible
+                    if paper_id and re.search(rf"(?<!\w){re.escape(entity)}(?!\w)", abstract)
+                ]
+                if len(abstract_matches) == 1:
+                    matches = abstract_matches
+            if len(matches) != 1 and re.fullmatch(r"[A-Z0-9]+(?:-[A-Z0-9]+)+", entity):
+                # Query spelling and paper spelling can differ by one letter
+                # (for example AP-BPTT vs. AT-BPTT).  Only accept one unique,
+                # same-length hyphenated acronym from a candidate abstract.
+                typo_matches = [
+                    paper_id for paper_id, _title, _terms, abstract, _raw_title in eligible
+                    if paper_id and any(
+                        len(normalized_entity) == len(acronym)
+                        and sum(left != right for left, right in zip(normalized_entity, acronym)) == 1
+                        for acronym in (
+                            re.sub(r"[^a-z0-9]+", "", value.lower())
+                            for value in re.findall(r"\b[A-Z0-9]+(?:-[A-Z0-9]+)+\b", abstract)
+                        )
+                    )
+                ]
+                if len(typo_matches) == 1:
+                    matches = typo_matches
+            if len(matches) != 1:
+                entity_words = re.findall(r"[A-Za-z0-9]+", entity)
+                anchor = entity_words[0] if entity_words else ""
+                # A descriptive phrase such as "Gaussian splatting editing"
+                # is not a paper identity.  Only a leading, literal uppercase
+                # acronym can safely use the fallback overlap route.
+                if len(anchor) < 4 or not anchor.isupper():
+                    continue
+                entity_terms = {term for term in tokenize(entity) if len(term) >= 4 and term not in _TITLE_ROUTING_STOPWORDS}
+                scored = [
+                    (len(entity_terms & title_terms), paper_id)
+                    for paper_id, _title, title_terms, _abstract, _raw_title in eligible
+                    if paper_id and anchor.lower() in title_terms
+                ]
+                best = max((score for score, _paper_id in scored), default=0)
+                matches = [paper_id for score, paper_id in scored if score == best] if best >= 2 else []
+            if len(matches) != 1:
+                continue
+            route_query = re.sub(r"\s+", " ", " ".join([*source_types, entity, *conditions])).strip()
+            key = (matches[0], route_query, tuple(route_types))
+            if not route_query or key in seen:
+                continue
+            seen.add(key)
+            routes.append({
+                "slot_id": str(slot.get("id") or f"S{len(routes) + 1:03d}"),
+                "paper_id": matches[0],
+                "record_types": route_types,
+                "query": route_query,
+            })
+    return routes
+
+
+def plan_augmented_rerank_query(plan: dict[str, Any], question: str) -> str:
+    """Rerank query = question + slot entities + slot conditions (path a)."""
+    parts = [str(question)]
+    seen: set[str] = set()
+    for slot in plan.get("slots") or []:
+        for key in ("entities", "required_conditions"):
+            for value in slot.get(key) or []:
+                text = str(value).strip()
+                if text and text not in seen:
+                    seen.add(text)
+                    parts.append(text)
+    return " ".join(parts)
 
 
 def validate_slot_plan(
@@ -190,11 +435,17 @@ def validate_slot_plan(
             source = _SOURCE_TYPE_ALIASES.get(raw_source.lower(), raw_source)
             if source in OFFICIAL_EVIDENCE_SOURCE_TYPES and source not in source_types:
                 source_types.append(source)
-        primary = to_official_source_type(source_type=sample.get("primary_evidence_type"))
-        if not source_types and primary:
-            source_types = [primary]
-        # Slot planning replaces metadata evidence planning. Paper identity is
-        # established later from evidence-bound C-keys, never guessed here.
+        explicit_types = explicit_source_type_mentions(sample.get("question"))
+        # A planner's generic text_span default must not erase an explicit
+        # numbered object named by the public question. Answer output shape
+        # and descriptive slot entity text are never consulted here.
+        if source_types == ["text_span"] and explicit_types:
+            source_types = list(explicit_types)
+            audit.append({"status": "slot_source_type_explicitly_corrected", "index": index, "source_types": source_types})
+        if not source_types:
+            source_types = list(derive_task_structure(sample).preferred_source_types)
+        # Paper identity is established later from evidence-bound C-keys,
+        # never guessed by a slot.  Legacy paper_scope input is ignored.
         requested_papers = _strings(row.get("paper_scope"), 12)
         role = str(row.get("role") or "direct_answer")
         raw_operation = str(row.get("operation") or "direct").lower()
@@ -206,7 +457,7 @@ def validate_slot_plan(
         dropped_conditions = _paper_identity_conditions(requested_conditions, candidates)
         slot = {
             "id": f"S{len(accepted) + 1:03d}", "role": role, "operation": operation,
-            "paper_scope": [], "required_source_types": source_types,
+            "required_source_types": source_types,
             "entities": _strings(row.get("entities")),
             "required_conditions": [
                 condition
@@ -219,17 +470,75 @@ def validate_slot_plan(
             {
                 "status": "slot_accepted",
                 "slot_id": slot["id"],
-                "paper_scope_removed": bool(requested_papers),
+                "legacy_paper_scope_ignored": bool(requested_papers),
                 "paper_identity_conditions_dropped": sorted(dropped_conditions),
             }
         )
     if not accepted:
         fallback = _default_plan(sample)
         return fallback, [*audit, {"status": "slot_plan_fallback"}]
+    raw_analysis = value.get("query_analysis") if isinstance(value.get("query_analysis"), dict) else {}
+    analysis_entities = _strings(raw_analysis.get("entities"))
+    analysis_comparison_targets = _strings(raw_analysis.get("comparison_targets"), 8)
+    try:
+        inferred_count = int(raw_analysis.get("inferred_paper_count"))
+        if not 1 <= inferred_count <= 50:
+            inferred_count = None
+    except (TypeError, ValueError):
+        inferred_count = None
+    raw_cross_paper = raw_analysis.get("cross_paper_synthesis_required")
+    cross_flag = raw_cross_paper if isinstance(raw_cross_paper, bool) else None
+    # Deterministic routing: the LLM reads the question, the rules decide the
+    # execution mode.  Structured signals win; when the plan carries no
+    # structured analysis at all, fall back to the query heuristics.
+    listed_entities_across_papers = any(
+        slot["operation"] == "list" and len(slot["entities"]) >= 2
+        for slot in accepted
+    ) and bool(re.search(r"\bacross\b.{0,80}\bpapers?\b", str(sample.get("question") or ""), re.IGNORECASE))
+    structured_multi = bool(
+        (inferred_count is not None and inferred_count >= 2)
+        or len(analysis_comparison_targets) >= 2
+        or (cross_flag and len(analysis_entities) >= 1)
+        or listed_entities_across_papers
+    )
+    fallback_multi = derive_task_structure(sample).is_multi_paper
+    # Structured signals add multi-paper routing; the question heuristics stay
+    # as a safety net so a sparse LLM analysis can never downgrade a multi
+    # question to single.  This mirrors derive_task_structure() exactly.
+    requires_cross = structured_multi or fallback_multi
+    if requires_cross != cross_flag or requires_cross != bool(value.get("requires_cross_paper_synthesis")):
+        audit.append(
+            {
+                "status": "cross_paper_routing_deterministic",
+                "structured_multi": structured_multi,
+                "fallback_multi": fallback_multi,
+                "llm_cross_paper_flag": cross_flag,
+                "derived_cross_paper": requires_cross,
+            }
+        )
+    if requires_cross:
+        expanded: list[dict[str, Any]] = []
+        for slot in accepted:
+            entities = slot["entities"]
+            if slot["operation"] == "list" and len(entities) > 1:
+                expanded.extend({**slot, "entities": [entity]} for entity in entities)
+                audit.append({
+                    "status": "cross_paper_list_slot_split",
+                    "slot_id": slot["id"],
+                    "entity_count": len(entities),
+                })
+            else:
+                expanded.append(slot)
+        accepted = [{**slot, "id": f"S{index:03d}"} for index, slot in enumerate(expanded[:16], start=1)]
     return {
         "version": SLOT_PLAN_VERSION, "slots": accepted,
-        "relations": _strings(value.get("relations"), 8),
-        "requires_cross_paper_synthesis": bool(value.get("requires_cross_paper_synthesis")),
+        "requires_cross_paper_synthesis": requires_cross,
+        "query_analysis": {
+            "entities": analysis_entities,
+            "comparison_targets": analysis_comparison_targets,
+            "inferred_paper_count": inferred_count,
+            "cross_paper_synthesis_required": cross_flag,
+        },
         "fallback": False,
     }, audit
 
@@ -479,7 +788,6 @@ def slot_cards(
     focus_terms = _focus_routing_terms(" ".join([*slot.get("entities", []), *slot.get("required_conditions", [])]))
     locator_terms = _explicit_locator_terms(question)
     types = set(slot.get("required_source_types") or [])
-    papers = set(slot.get("paper_scope") or [])
     metadata = projection.get("_card_metadata") or {}
     key_index = projection.get("_key_index") or {}
     card_support = projection.get("_card_support_keys") or {}
@@ -505,12 +813,15 @@ def slot_cards(
         item_text = _card_text(item)
         item_type = str((metadata.get(key) or {}).get("source_type") or item.get("source_type") or "")
         item_paper = str(item.get("paper_id") or "")
+        item_paper_id = paper_ids_by_key.get(str(item.get("paper_key") or ""), item_paper)
+        routed_paper_id = str(slot.get("routed_paper_id") or "")
+        if routed_paper_id and item_paper_id != routed_paper_id:
+            continue
         label = str(item.get("object_label") or (metadata.get(key) or {}).get("object_label") or "")
         # The required source type dominates the packet so a figure/table/
         # equation/citation slot always surfaces its own object cards before
         # nearby prose; text context cards may still rank after them.
-        score = 100 * int(not types or item_type in types) + 2 * int(not papers or item_paper in papers)
-        item_paper_id = paper_ids_by_key.get(str(item.get("paper_key") or ""), item_paper)
+        score = 100 * int(not types or item_type in types)
         score += 1000 * int(bool(named_papers) and item_paper_id in named_papers)
         item_terms = set(tokenize(item_text))
         score += len(question_terms.intersection(item_terms))
@@ -793,13 +1104,11 @@ def _rows_from_evidence_values(
             columns.append(text)
     if not columns:
         return []
-    by_normalized = {_normalize_column_name(column): column for column in columns}
     first = columns[0]
     rows: list[dict[str, Any]] = []
     current: dict[str, Any] | None = None
     for item in evidence_values:
-        name = _normalize_column_name(item.get("name"))
-        column = by_normalized.get(name)
+        column = match_schema_column(item.get("name"), columns)
         if column is None:
             continue
         if column == first and current is not None:
@@ -951,13 +1260,26 @@ def validate_slot_extraction(
                 keys.append(key)
     raw_table_rows = row.get("table_rows")
     table_rows: list[dict[str, Any]] = []
+    schema_columns: list[str] = []
+    if table_schema:
+        schema_columns = [
+            str(column) for column in (table_schema or [])
+            if isinstance(column, dict) and str(column.get("name") or "")
+        ] or [str(column) for column in (table_schema or []) if str(column)]
     if isinstance(raw_table_rows, list):
         for item in raw_table_rows[:16]:
             if not isinstance(item, dict):
                 continue
             values = item.get("values") if isinstance(item.get("values"), dict) else {}
             row_keys = [key for key in _strings(item.get("support_keys"), 4) if key in card_map]
-            clean_values = {str(column): value for column, value in values.items() if str(value or "").strip()}
+            if schema_columns:
+                clean_values = {
+                    column: value
+                    for column, value in remap_row_values(values, schema_columns).items()
+                    if str(value or "").strip()
+                }
+            else:
+                clean_values = {str(column): value for column, value in values.items() if str(value or "").strip()}
             if not clean_values or not row_keys:
                 continue
             for key in row_keys:
@@ -969,10 +1291,6 @@ def validate_slot_extraction(
         if not table_rows and evidence_values:
             table_rows = _rows_from_evidence_values(evidence_values, table_schema)
         if table_schema:
-            schema_columns = [
-                str(column) for column in (table_schema or [])
-                if isinstance(column, dict) and str(column.get("name") or "")
-            ] or [str(column) for column in (table_schema or []) if str(column)]
             table_sources = []
             for key in keys:
                 proposition = str((metadata.get(key) or {}).get("proposition") or "")
